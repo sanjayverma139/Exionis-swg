@@ -116,6 +116,9 @@ Every TCP/UDP connection is:
 
 ## 🏗️ Architecture
 
+<img width="7799" height="8291" alt="mermaid-1776943925149" src="https://github.com/user-attachments/assets/aa86a765-cf47-4314-9f8e-fd3e3e736e9e" />
+
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Windows Kernel                              │
