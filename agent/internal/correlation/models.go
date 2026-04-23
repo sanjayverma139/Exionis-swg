@@ -6,6 +6,19 @@ import (
 	"time"
 )
 
+// ============================================================================
+// CONNECTION STATE ENUM
+// ============================================================================
+type ConnectionState string
+
+const (
+	StateNew       ConnectionState = "new"
+	StateEstablished               = "established"
+	StateClosing                   = "closing"
+	StateClosed                    = "closed"
+	StateUnknown                   = "unknown"
+)
+
 // ProcessInfo holds enriched process metadata
 type ProcessInfo struct {
 	PID         uint32
@@ -69,24 +82,25 @@ type SpawnStats struct {
 	ParentImage string
 	ChildImage  string
 	FirstSeen   time.Time
-	LastSeen    time.Time  // ← Critical for eviction
+	LastSeen    time.Time
 	Count       int
 	WindowStart time.Time
 }
 
-// ConnectionInfo holds network connection metadata
+// ConnectionInfo holds network connection metadata with state tracking
 type ConnectionInfo struct {
-	RemoteIP   string    `json:"remote_ip"`
-	RemotePort uint16    `json:"remote_port"`
-	Protocol   string    `json:"protocol"`
-	BytesSent  uint64    `json:"bytes_sent"`
-	BytesRecv  uint64    `json:"bytes_recv"`
-	FirstSeen  time.Time `json:"first_seen"`
-	LastSeen   time.Time `json:"last_seen"`
-	Domain     string    `json:"domain,omitempty"`
+	RemoteIP   string          `json:"remote_ip"`
+	RemotePort uint16          `json:"remote_port"`
+	Protocol   string          `json:"protocol"`
+	BytesSent  uint64          `json:"bytes_sent"`
+	BytesRecv  uint64          `json:"bytes_recv"`
+	FirstSeen  time.Time       `json:"first_seen"`
+	LastSeen   time.Time       `json:"last_seen"`
+	Domain     string          `json:"domain,omitempty"`
+	State      ConnectionState `json:"state"` // ✅ NEW: Connection state machine
 }
 
-// UpsertConnection adds or updates a connection record
+// UpsertConnection adds or updates a connection record with state merging
 func (p *ProcessInfo) UpsertConnection(conn *ConnectionInfo) {
 	p.connMu.Lock()
 	defer p.connMu.Unlock()
@@ -100,6 +114,10 @@ func (p *ProcessInfo) UpsertConnection(conn *ConnectionInfo) {
 			existing.LastSeen = conn.LastSeen
 			if existing.Domain == "" && conn.Domain != "" {
 				existing.Domain = conn.Domain
+			}
+			// ✅ Preserve state unless new state is more definitive
+			if conn.State != StateUnknown && conn.State != existing.State {
+				existing.State = conn.State
 			}
 			return
 		}
@@ -115,4 +133,18 @@ func (p *ProcessInfo) GetConnections() []*ConnectionInfo {
 	result := make([]*ConnectionInfo, len(p.Connections))
 	copy(result, p.Connections)
 	return result
+}
+
+// GetConnectionsByState filters connections by state (helper for queries)
+func (p *ProcessInfo) GetConnectionsByState(state ConnectionState) []*ConnectionInfo {
+	p.connMu.RLock()
+	defer p.connMu.RUnlock()
+	var filtered []*ConnectionInfo
+	for _, conn := range p.Connections {
+		if conn.State == state {
+			cpy := *conn
+			filtered = append(filtered, &cpy)
+		}
+	}
+	return filtered
 }

@@ -185,15 +185,16 @@ func (e *Engine) forwardNetworkEvents() {
 
 		if exists && proc.IsAlive {
 			conn := &ConnectionInfo{
-				RemoteIP:   netEvt.RemoteIP,
-				RemotePort: netEvt.RemotePort,
-				Protocol:   netEvt.Protocol,
-				BytesSent:  netEvt.BytesSent,
-				BytesRecv:  netEvt.BytesRecv,
-				FirstSeen:  netEvt.Timestamp,
-				LastSeen:   netEvt.Timestamp,
-				Domain:     netEvt.Domain,
-			}
+	RemoteIP:   netEvt.RemoteIP,
+	RemotePort: netEvt.RemotePort,
+	Protocol:   netEvt.Protocol,
+	BytesSent:  netEvt.BytesSent,
+	BytesRecv:  netEvt.BytesRecv,
+	FirstSeen:  netEvt.Timestamp,
+	LastSeen:   netEvt.Timestamp,
+	Domain:     netEvt.Domain,
+	State:      mapOpcodeToConnectionState(uint8(netEvt.Opcode), netEvt.Protocol), // ✅ NEW
+}
 			proc.UpsertConnection(conn)
 			connTableMu.Lock()
 			connectionTable[netEvt.PID] = append(connectionTable[netEvt.PID], conn)
@@ -897,4 +898,36 @@ func deleteProcessSafe(pid uint32) {
 
 func resolveProcessSID(pid uint32) string {
 	return ""
+}
+
+// ============================================================================
+// ✅ CONNECTION STATE MAPPING HELPER
+// ============================================================================
+// mapOpcodeToConnectionState maps ETW opcodes to our ConnectionState enum
+func mapOpcodeToConnectionState(opcode uint8, protocol string) ConnectionState {
+	if protocol != "TCP" {
+		return StateUnknown // UDP is connectionless
+	}
+	
+	// ETW opcode constants (from evntcons.h)
+	const (
+		EVENT_TRACE_TYPE_CONNECT    = 10
+		EVENT_TRACE_TYPE_ACCEPT     = 11
+		EVENT_TRACE_TYPE_RECONNECT  = 12
+		EVENT_TRACE_TYPE_SEND       = 13
+		EVENT_TRACE_TYPE_RECEIVE    = 14
+		EVENT_TRACE_TYPE_DISCONNECT = 15
+		EVENT_TRACE_TYPE_RETRANSMIT = 16
+	)
+	
+	switch opcode {
+	case EVENT_TRACE_TYPE_CONNECT, EVENT_TRACE_TYPE_ACCEPT, EVENT_TRACE_TYPE_RECONNECT:
+		return StateEstablished
+	case EVENT_TRACE_TYPE_DISCONNECT:
+		return StateClosed
+	case EVENT_TRACE_TYPE_SEND, EVENT_TRACE_TYPE_RECEIVE, EVENT_TRACE_TYPE_RETRANSMIT:
+		return StateEstablished // Active data transfer
+	default:
+		return StateNew
+	}
 }

@@ -26,6 +26,12 @@ func main() {
 		fmt.Printf("[Exionis] Privilege warning: %v\n", err)
 	}
 
+		// ✅ Initialize network filtering config
+	fmt.Println("[Exionis] Loading network filtering config...")
+	if err := config.InitNetworkConfig(config.DefaultInternalRanges()); err != nil {
+		fmt.Printf("[Exionis] Network config warning: %v\n", err)
+	}
+
 	// ✅ FIX 2: Bootstrap pre-existing processes BEFORE ETW starts
 	fmt.Println("[Exionis] Building initial process snapshot...")
 	correlation.PopulateInitialProcessTable()

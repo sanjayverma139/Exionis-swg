@@ -33,6 +33,11 @@
 #include "etw_bridge.h"
 
 /* ============================================================================
+ * CGO Forward Declarations for Go functions called from C
+ * ============================================================================*/
+extern int go_is_internal_ip(const char* ip);
+
+/* ============================================================================
  * GUID Definitions for ETW Providers
  * ============================================================================*/
 static const GUID EXIONIS_EVENT_TRACE_GUID =
@@ -73,6 +78,17 @@ static ULONG exionis_sid_length(const BYTE* ptr, ULONG max_bytes) {
 /* ============================================================================
  * Helper: Extract Parent PID from Process Event
  * ============================================================================*/
+
+ /* ============================================================================
+ * Helper: Check if IP is internal (calls Go via CGO)
+ * ============================================================================*/
+static int exionis_is_internal_ip(const char* ip) {
+    // This function calls the Go implementation via CGO
+    // Returns 1 if internal, 0 if external
+    return go_is_internal_ip(ip);
+}
+
+
 static ULONG exionis_extract_ppid(const BYTE* data, ULONG datalen, UCHAR version) {
     ULONG off = (version >= 3) ? 12 : 8;
     if (datalen < off + sizeof(ULONG)) return 0;
@@ -277,8 +293,14 @@ static VOID WINAPI exionis_event_record_callback(PEVENT_RECORD record) {
         ULONGLONG bytes = 0;
         if (!exionis_extract_network_fields(data, datalen, &pid, local_ip, sizeof(local_ip),
                 remote_ip, sizeof(remote_ip), &local_port, &remote_port, &family, &bytes)) { return; }
+        // ✅ ENHANCED: Skip localhost + configurable internal ranges
         if (strcmp(local_ip, "127.0.0.1") == 0 || strcmp(remote_ip, "127.0.0.1") == 0 ||
             strcmp(local_ip, "::1") == 0 || strcmp(remote_ip, "::1") == 0) { return; }
+        
+        // ✅ NEW: Call Go function to check internal IP filter
+        if (exionis_is_internal_ip(remote_ip)) { 
+            return; // Skip internal traffic if configured
+        }
         exionis_go_emit_network_event(pid, record->EventHeader.ThreadId, opcode,
             (unsigned long long)record->EventHeader.TimeStamp.QuadPart,
             local_ip, remote_ip, local_port, remote_port, (char*)protocol,

@@ -8,8 +8,10 @@ package etw
 */
 import "C"
 import (
+	"fmt"
 	"time"
 
+	"exionis/internal/config"
 	"exionis/internal/events"
 )
 
@@ -64,22 +66,33 @@ func exionis_go_emit_network_event(
 	ts := time.Unix(0, unixNano)
 
 	evt := events.NetworkEvent{
-		PID:        uint32(pid),
-		LocalIP:    C.GoString(localIP),
-		RemoteIP:   C.GoString(remoteIP),
-		LocalPort:  uint16(localPort),
-		RemotePort: uint16(remotePort),
-		Protocol:   C.GoString(protocol),
-		Direction:  mapOpcodeToDirection(uint8(opcode), C.GoString(protocol)),
-		BytesSent:  uint64(bytesSent),
-		BytesRecv:  uint64(bytesRecv),
-		Timestamp:  ts,
-	}
+	PID:        uint32(pid),
+	LocalIP:    C.GoString(localIP),
+	RemoteIP:   C.GoString(remoteIP),
+	LocalPort:  uint16(localPort),
+	RemotePort: uint16(remotePort),
+	Protocol:   C.GoString(protocol),
+	Direction:  mapOpcodeToDirection(uint8(opcode), C.GoString(protocol)),
+	BytesSent:  uint64(bytesSent),
+	BytesRecv:  uint64(bytesRecv),
+	Timestamp:  ts,
+	Opcode:     uint8(opcode), // ✅ NEW: Pass opcode for state mapping
+}
 
 	select {
 	case events.NetworkChan <- evt:
 	default:
 	}
+}
+
+// export go_is_internal_ip checks if an IP is internal (called from C)
+//export go_is_internal_ip
+func go_is_internal_ip(ip *C.char) C.int {
+	ipStr := C.GoString(ip)
+	if config.IsInternalIP(ipStr) {
+		return 1 // true: skip this event
+	}
+	return 0 // false: emit event
 }
 
 func mapOpcodeToDirection(opcode uint8, protocol string) string {
@@ -95,6 +108,11 @@ func mapOpcodeToDirection(opcode uint8, protocol string) string {
 
 // StartETWListener initializes and starts the ETW kernel trace session.
 func StartETWListener() error {
+	// ✅ Initialize internal IP filtering config
+	if err := config.InitNetworkConfig(config.DefaultInternalRanges()); err != nil {
+		return fmt.Errorf("failed to init network config: %w", err)
+	}
+	
 	status := C.exionis_start_kernel_trace()
 	if status != 0 && status != C.ERROR_ALREADY_EXISTS {
 		return &ETWError{Code: int(status), Message: "failed to start kernel trace"}

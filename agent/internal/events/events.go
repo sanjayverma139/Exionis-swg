@@ -29,6 +29,7 @@ type NetworkEvent struct {
 	BytesRecv  uint64    `json:"bytes_recv,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
 	Domain     string    `json:"domain,omitempty"`
+	Opcode     uint8     `json:"opcode"` // ✅ NEW: Required for state mapping
 }
 
 // Global buffered channels for event distribution.
