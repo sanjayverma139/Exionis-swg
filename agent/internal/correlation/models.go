@@ -29,6 +29,8 @@ type ProcessInfo struct {
 	StartTime   time.Time
 	EndTime     time.Time
 	IsAlive     bool
+	IsOrphan    bool          // ← ADD THIS
+	Username    string        // ← ADD THIS
 	Parent      *ProcessInfo
 	Children    []*ProcessInfo
 	Enrichment  ProcessEnrichment
@@ -43,6 +45,10 @@ type ProcessEnrichment struct {
 	IsSigned       bool   `json:"is_signed"`
 	IsSystem       bool   `json:"is_system"`
 	UserSID        string `json:"user_sid,omitempty"`
+	Username       string `json:"username,omitempty"`       // ← ADD
+	SizeBytes      int64  `json:"size_bytes,omitempty"`     // ← ADD
+	SizeKB         int64  `json:"size_kb,omitempty"`        // ← ADD
+	IsOrphan       bool   `json:"is_orphan,omitempty"`      // ← ADD
 }
 
 // StructuredEvent is the unified output format

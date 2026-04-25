@@ -9,7 +9,9 @@ import (
 	"os"
 	"strings"
 	"time"
-
+	"syscall"
+	"unsafe"
+	"golang.org/x/sys/windows"
 	"github.com/shirou/gopsutil/v3/process"
 )
 
@@ -173,5 +175,215 @@ func IsProcessAccessible(pid uint32) bool {
 
 // GetProcessUser retrieves the user SID for a process (stub)
 func GetProcessUser(pid uint32) string {
-	return ""
+	return GetProcessUserSID(pid) // or GetProcessUsername(pid) for "DOMAIN\User"
+}
+
+
+// ============================================================================
+// GAP 1 — Username / Running User
+// ============================================================================
+
+// GetProcessUsername returns "DOMAIN\User" for the given PID.
+func GetProcessUsername(pid uint32) string {
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false,
+		pid,
+	)
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(handle)
+
+	var token windows.Token
+	err = windows.OpenProcessToken(handle, windows.TOKEN_QUERY, &token)
+	if err != nil {
+		return ""
+	}
+	defer token.Close()
+
+	tokenUser, err := token.GetTokenUser()
+	if err != nil {
+		return ""
+	}
+
+	account, domain, _, err := tokenUser.User.Sid.LookupAccount("")
+	if err != nil {
+		return tokenUser.User.Sid.String()
+	}
+
+	if domain != "" {
+		return domain + `\` + account
+	}
+	return account
+}
+
+// GetProcessUserSID returns the raw SID string for the given PID.
+func GetProcessUserSID(pid uint32) string {
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false,
+		pid,
+	)
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(handle)
+
+	var token windows.Token
+	if err := windows.OpenProcessToken(handle, windows.TOKEN_QUERY, &token); err != nil {
+		return ""
+	}
+	defer token.Close()
+
+	tokenUser, err := token.GetTokenUser()
+	if err != nil {
+		return ""
+	}
+	return tokenUser.User.Sid.String()
+}
+
+// ============================================================================
+// GAP 2 — Real Process Start Time
+// ============================================================================
+
+// GetProcessStartTime returns the real creation time of a process.
+func GetProcessStartTime(pid uint32) time.Time {
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false,
+		pid,
+	)
+	if err != nil {
+		return time.Time{}
+	}
+	defer windows.CloseHandle(handle)
+
+	var creation, exit, kernel, user windows.Filetime
+	err = windows.GetProcessTimes(
+		handle,
+		&creation,
+		&exit,
+		&kernel,
+		&user,
+	)
+	if err != nil {
+		return time.Time{}
+	}
+
+	return time.Unix(0, creation.Nanoseconds())
+}
+
+// ============================================================================
+// GAP 3 — File Size, Creation Time, Last Modified
+// ============================================================================
+
+// FileMetadata holds binary file attributes for process enrichment.
+type FileMetadata struct {
+	SizeBytes    int64     `json:"size_bytes,omitempty"`
+	SizeKB       int64     `json:"size_kb,omitempty"`
+	CreationTime time.Time `json:"creation_time,omitempty"`
+	ModifiedTime time.Time `json:"modified_time,omitempty"`
+}
+
+// GetFileMetadata returns size and timestamps for the given file path.
+func GetFileMetadata(path string) (FileMetadata, bool) {
+	if path == "" || path == "unknown" {
+		return FileMetadata{}, false
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return FileMetadata{}, false
+	}
+
+	meta := FileMetadata{
+		SizeBytes:    info.Size(),
+		SizeKB:       info.Size() / 1024,
+		ModifiedTime: info.ModTime(),
+	}
+
+	if sys, ok := info.Sys().(*syscall.Win32FileAttributeData); ok {
+		ft := sys.CreationTime
+		nsec := int64(ft.HighDateTime)<<32 | int64(ft.LowDateTime)
+		const unixEpochOffset = 116444736000000000
+		nsec = (nsec - unixEpochOffset) * 100
+		if nsec > 0 {
+			meta.CreationTime = time.Unix(0, nsec)
+		}
+	}
+
+	return meta, true
+}
+
+// ============================================================================
+// GAP 4 — Orphan Process Detection
+// ============================================================================
+
+// IsOrphanProcess returns true if the process's parent no longer exists.
+func IsOrphanProcess(pid uint32, livePIDs map[uint32]bool) bool {
+	ppid := GetParentPID(pid)
+	if ppid == 0 || ppid == 4 {
+		return false
+	}
+	return !livePIDs[ppid]
+}
+
+// BuildLivePIDSet returns a set of all currently running PIDs.
+func BuildLivePIDSet() map[uint32]bool {
+	procs := GetProcesses()
+	set := make(map[uint32]bool, len(procs))
+	for _, p := range procs {
+		set[uint32(p.PID)] = true
+	}
+	return set
+}
+
+// ============================================================================
+// GAP 5 — Process Architecture (32-bit vs 64-bit)
+// ============================================================================
+
+var (
+	modKernel32         = syscall.NewLazyDLL("kernel32.dll")
+	procIsWow64Process2 = modKernel32.NewProc("IsWow64Process2")
+)
+
+// GetProcessArchitecture returns "x64", "x86", or "unknown".
+func GetProcessArchitecture(pid uint32) string {
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false,
+		pid,
+	)
+	if err != nil {
+		return "unknown"
+	}
+	defer windows.CloseHandle(handle)
+
+	var processMachine, nativeMachine uint16
+	ret, _, _ := procIsWow64Process2.Call(
+		uintptr(unsafe.Pointer(handle)),
+		uintptr(unsafe.Pointer(&processMachine)),
+		uintptr(unsafe.Pointer(&nativeMachine)),
+	)
+	if ret == 0 {
+		return "unknown"
+	}
+
+	switch processMachine {
+	case 0x014c:
+		return "x86"
+	case 0x8664:
+		return "x64"
+	case 0xAA64:
+		return "arm64"
+	case 0x0000:
+		switch nativeMachine {
+		case 0x8664:
+			return "x64"
+		case 0xAA64:
+			return "arm64"
+		}
+	}
+	return "unknown"
 }

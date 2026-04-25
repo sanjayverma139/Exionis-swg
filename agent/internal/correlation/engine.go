@@ -89,23 +89,43 @@ func GetActiveConnectionCount() int {
 // PopulateInitialProcessTable bootstraps the process table before ETW starts
 func PopulateInitialProcessTable() {
 	procs := process.GetProcesses()
+	livePIDs := process.BuildLivePIDSet()
+
 	tableMu.Lock()
 	defer tableMu.Unlock()
-	
+
 	for _, p := range procs {
 		if _, exists := processTable[uint32(p.PID)]; exists {
 			continue
 		}
+
+		// FIX: Get real process start time instead of fake time.Now()-1hour
+		startTime := process.GetProcessStartTime(uint32(p.PID))
+		if startTime.IsZero() {
+			startTime = time.Now().Add(-1 * time.Hour)
+		}
+
+		// FIX: Get real username
+		username := process.GetProcessUsername(uint32(p.PID))
+
+		// FIX: Detect orphan processes
+		isOrphan := process.IsOrphanProcess(uint32(p.PID), livePIDs)
+
 		proc := &ProcessInfo{
-			PID:       uint32(p.PID),
-			Image:     p.Name,
+			PID:      uint32(p.PID),
+			Image:    p.Name,
 			ImagePath: p.Path,
-			StartTime: time.Now().Add(-1 * time.Hour), // Approximate
-			IsAlive:   true,
+			StartTime: startTime,
+			IsAlive:  true,
+			IsOrphan: isOrphan,
+			Username: username,
 			Enrichment: ProcessEnrichment{
-				IsSystem: isSystemProcess(p.Path), // ✅ FIX 3: Correct system detection
+				IsSystem: isSystemProcess(p.Path),
+				Username: username,
+				IsOrphan: isOrphan,
 			},
 		}
+
 		if parentPID := process.GetParentPID(uint32(p.PID)); parentPID > 0 {
 			proc.PPID = parentPID
 			if parent, ok := processTable[parentPID]; ok {
@@ -113,7 +133,7 @@ func PopulateInitialProcessTable() {
 				parent.Children = append(parent.Children, proc)
 			}
 		}
-		// Async enrichment for bootstrap processes
+
 		go enrichProcessAsync(proc, p.Name)
 		processTable[uint32(p.PID)] = proc
 	}
@@ -406,9 +426,17 @@ func (e *Engine) tryFallbackEnrichment(pid uint32, proc *ProcessInfo) {
 // EVENT EMITTERS
 // ============================================================================
 func emitProcessStart(proc *ProcessInfo, seq uint64) {
+	// FIX: resolve parent_image from table directly, not just proc.Parent pointer
+	// proc.Parent can be nil due to async timing even when parent exists in table
 	parentImage := ""
 	if proc.Parent != nil && proc.Parent.Image != "" {
 		parentImage = proc.Parent.Image
+	} else if proc.PPID > 0 {
+		tableMu.RLock()
+		if parent, ok := processTable[proc.PPID]; ok {
+			parentImage = parent.Image
+		}
+		tableMu.RUnlock()
 	}
 	evt := StructuredEvent{
 		EventType:   "process_start",
@@ -489,13 +517,15 @@ func emitNetworkEvent(evt events.NetworkEvent, proc *ProcessInfo) {
 }
 
 func nonBlockingEmit(evt StructuredEvent) {
+	// Print to stdout immediately
+	if jsonBytes, err := json.Marshal(evt); err == nil {
+		fmt.Printf("%s\n", string(jsonBytes))
+	}
+	// Send to StructuredOutput for file sink in main.go (non-blocking)
+	// main.go goroutine writes to FILE ONLY — it does NOT print to stdout
 	select {
 	case StructuredOutput <- evt:
-		if jsonBytes, err := json.Marshal(evt); err == nil {
-			fmt.Printf("%s\n", string(jsonBytes))
-		}
 	default:
-		// Log drop if needed for debugging
 	}
 }
 

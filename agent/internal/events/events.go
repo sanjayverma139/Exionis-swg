@@ -43,6 +43,21 @@ type NetworkEvent struct {
 // Global buffered channels for event distribution.
 // Initialized at package load time. Thread-safe via Go channels.
 var (
-	ProcessChan = make(chan EventInput, 10000)
-	NetworkChan = make(chan NetworkEvent, 10000)
+	ProcessChan       = make(chan EventInput, 10000)
+	NetworkChan       = make(chan NetworkEvent, 10000)
+	NetworkOutputChan = make(chan NetworkOutputRecord, 5000)
 )
+
+// NetworkOutputRecord is a simplified record for file writing
+type NetworkOutputRecord struct {
+	Timestamp  string `json:"timestamp"`
+	PID        uint32 `json:"pid"`
+	Image      string `json:"image"`
+	RemoteIP   string `json:"remote_ip"`
+	RemotePort uint16 `json:"remote_port"`
+	Protocol   string `json:"protocol"`
+	Domain     string `json:"domain,omitempty"`
+	BytesSent  uint64 `json:"bytes_sent,omitempty"`
+	BytesRecv  uint64 `json:"bytes_recv,omitempty"`
+	State      string `json:"state"`
+}
