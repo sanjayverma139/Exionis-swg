@@ -89,32 +89,54 @@ This project is a **Hybrid Secure Web Gateway (SWG) + Endpoint Agent** designed 
 Exionis-swg/
 │
 ├── agent/
-│   ├── cmd/
-│   │   └── agent/
-│   │       └── main.go
+│   ├── cmd/agent/
+│   │   └── main.go                          # Entry point: initializes all modules, starts ETW, handles signals
 │   │
 │   ├── internal/
-│   │   ├── dns/
-│   │   ├── proxy/
-│   │   ├── network/
-│   │   ├── process/
-│   │   ├── enforcement/
-│   │   ├── bridge/
 │   │   ├── config/
+│   │   │   ├── network.go                   # Internal IP range filtering (RFC1918 + config)
+│   │   │   └── privilege.go                 # Windows privilege escalation (SeDebug, SeSystemProfile)
+│   │   │
+│   │   ├── correlation/
+│   │   │   ├── engine.go                    # 🧠 Core: Event router, process lifecycle, network correlation
+│   │   │   └── models.go                    # Data structs: ProcessInfo, ConnectionInfo, StructuredEvent
+│   │   │
+│   │   ├── etw/
+│   │   │   ├── etw_bridge.c                 # 🔗 C layer: ETW callback, network field extraction (20-byte IPv4 layout)
+│   │   │   ├── etw_bridge.h                 # CGO declarations for Go↔C communication
+│   │   │   └── etw_native_engine.go         # Go layer: CGO callbacks → Go channels
+│   │   │
+│   │   ├── events/
+│   │   │   └── events.go                    # Shared event types + buffered channels (ProcessChan, NetworkChan)
+│   │   │
+│   │   ├── inventory/
+│   │   │   └── apps.go                      # Registry scanner: HKLM/HKCU/WoW64 app enumeration + deduplication
+│   │   │
 │   │   ├── logger/
+│   │   │   └── file_sink.go                 # Rotating NDJSON logger (100MB/10 files)
+│   │   │
+│   │   ├── output/
+│   │   │   └── file_output.go               # Cloud-ready writers: apps_*.ndjson, processes_*.ndjson, network_*.ndjson
+│   │   │
+│   │   ├── process/
+│   │   │   └── collector.go                 # Process enumeration: PID, path, hash, signature, username, start time
+│   │   │
+│   │   ├── store/                           # (Future: local event buffering)
+│   │   │
 │   │   └── utils/
+│   │       └── deviceid.go                  # Hardware fingerprint: Machine GUID + Disk Serial → SHA256 hash
 │   │
-│   ├── scripts/
-│   ├── go.mod
-│   └── go.sum
+│   ├── scripts/                             # Build/deployment helpers
+│   ├── go.mod                               # Go module definition
+│   ├── go.sum                               # Dependency checksums
+│   └── README.md                            # Agent-specific documentation
 │
-├── policy-engine/
-├── shared/
-├── cloud/
-├── configs/
-├── logs/
-└── README.md
-```
+├── policy-engine/                           # (Future: JS-based policy evaluation layer)
+├── shared/                                  # (Future: Common types between agent/cloud)
+├── cloud/                                   # (Future: Supabase schema, API handlers)
+├── configs/                                 # Default configs, policy templates
+├── logs/                                    # Local log storage (rotated)
+└── README.md                                # 📚 Master documentation (see below)```
 
 ---
 
@@ -229,6 +251,14 @@ Capture complete **application and process visibility**
 ✔ Full device inventory
 ✔ Real-time process tracking
 
+
+ PHASE 1: DEVICE SHADOWING ✅ COMPLETE
+✅ Installed Applications Collection (HKLM/HKCU/WoW64)
+✅ Running Process Monitoring (PID, PPID, path, username)
+✅ Process Metadata Enrichment (SHA256, signature, file size, start time)
+✅ Orphan Process Detection
+✅ Device ID Generation (privacy-safe hardware fingerprint)
+✅ Output Structure: device_inventory JSON + NDJSON files
 ---
 
 # 🥈 PHASE 2: PROCESS → NETWORK MAPPING
@@ -279,6 +309,17 @@ Map which application is communicating with which network endpoint
 ✔ Data usage tracking per process
 
 ---
+
+🥈 PHASE 2: PROCESS → NETWORK MAPPING ✅ COMPLETE
+✅ ETW Kernel Session Setup (Process + Network providers)
+✅ CGO Bridge: C callback → Go channels
+✅ Network Event Parsing (20-byte IPv4 layout fix)
+✅ PID → Process Name Correlation (with fallback)
+✅ Connection State Machine (new/established/closing/closed)
+✅ Async DNS Resolution + Cache
+✅ Internal IP Filtering (configurable RFC1918 + custom)
+✅ Dual Output: stdout (for piping) + NDJSON files
+✅ Stdout Flush Fix (for findstr/SIEM compatibility)
 
 # 🥉 PHASE 3: DNS INTERCEPTION
 
