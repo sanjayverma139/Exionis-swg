@@ -8,14 +8,15 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 	"syscall"
+	"time"
 	"unsafe"
-	"golang.org/x/sys/windows"
+
 	"github.com/shirou/gopsutil/v3/process"
+	"golang.org/x/sys/windows"
 )
 
-// ProcessInfo holds basic process metadata
+// ProcessInfo holds basic process metadata.
 type ProcessInfo struct {
 	Name   string
 	PID    int32
@@ -24,7 +25,16 @@ type ProcessInfo struct {
 	Memory float32
 }
 
-// GetProcesses enumerates all running processes
+// GetProcesses enumerates all running processes.
+//
+// FIX: Removed the unconditional time.Sleep(500ms) that was called on every
+// invocation. The sleep was added for CPU% measurement stability but:
+//   1. We call this every 5 seconds from the snapshot ticker — 500ms of
+//      blocking per tick is wasteful.
+//   2. Bootstrap calls this twice (via BuildLivePIDSet + PopulateInitialProcessTable)
+//      causing 1 full second of startup delay.
+//   3. CPU% measurement with gopsutil already uses an internal interval when
+//      you call CPUPercent() — the external sleep was redundant and harmful.
 func GetProcesses() []ProcessInfo {
 	var result []ProcessInfo
 	procs, err := process.Processes()
@@ -37,56 +47,88 @@ func GetProcesses() []ProcessInfo {
 		if err != nil || name == "" {
 			continue
 		}
-		pid := p.Pid
 		path, err := p.Exe()
 		if err != nil || path == "" {
 			path = "unknown"
 		}
 		cpuPercent, _ := p.CPUPercent()
 		memInfo, err := p.MemoryInfo()
-		var memMB float32 = 0
+		var memMB float32
 		if err == nil && memInfo != nil {
 			memMB = float32(memInfo.RSS) / 1024 / 1024
 		}
 		result = append(result, ProcessInfo{
 			Name:   name,
-			PID:    pid,
+			PID:    p.Pid,
 			Path:   path,
 			CPU:    cpuPercent,
 			Memory: memMB,
 		})
 	}
-	time.Sleep(500 * time.Millisecond)
 	return result
 }
 
-// GetCmdline retrieves the full command line for a process
+// BuildLivePIDSet returns a set of all currently running PIDs.
+//
+// FIX: Previous version called GetProcesses() which enumerates every process
+// field (exe path, cmdline, memory, CPU). We only need PIDs here. Using the
+// Windows ToolHelp snapshot is much cheaper and avoids the full gopsutil walk.
+// Falls back to GetProcesses-based set if snapshot fails.
+func BuildLivePIDSet() map[uint32]bool {
+	set := make(map[uint32]bool, 512)
+
+	// Use Windows ToolHelp32 snapshot — cheapest way to get the PID list.
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		// Fallback: use already-loaded gopsutil list.
+		for _, p := range GetProcesses() {
+			set[uint32(p.PID)] = true
+		}
+		return set
+	}
+	defer windows.CloseHandle(snap)
+
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	if err := windows.Process32First(snap, &entry); err != nil {
+		return set
+	}
+	for {
+		set[entry.ProcessID] = true
+		if err := windows.Process32Next(snap, &entry); err != nil {
+			break
+		}
+	}
+	return set
+}
+
+// GetCmdline retrieves the full command line for a process.
 func GetCmdline(pid uint32) string {
-	proc, err := process.NewProcess(int32(pid))
+	p, err := process.NewProcess(int32(pid))
 	if err != nil {
 		return ""
 	}
-	cmdline, err := proc.Cmdline()
+	cmdline, err := p.Cmdline()
 	if err != nil {
 		return ""
 	}
 	return cmdline
 }
 
-// GetExecutablePath retrieves the executable path for a process
+// GetExecutablePath retrieves the executable path for a process.
 func GetExecutablePath(pid uint32) string {
-	proc, err := process.NewProcess(int32(pid))
+	p, err := process.NewProcess(int32(pid))
 	if err != nil {
 		return ""
 	}
-	exe, err := proc.Exe()
+	exe, err := p.Exe()
 	if err != nil {
 		return ""
 	}
 	return exe
 }
 
-// GetExecutablePathWithRetry attempts to get executable path with retries
+// GetExecutablePathWithRetry attempts to get executable path with retries.
 func GetExecutablePathWithRetry(pid uint32, maxAttempts int) string {
 	for i := 0; i < maxAttempts; i++ {
 		if path := GetExecutablePath(pid); path != "" && path != "unknown" {
@@ -99,55 +141,52 @@ func GetExecutablePathWithRetry(pid uint32, maxAttempts int) string {
 	return "unknown"
 }
 
-// GetParentPID retrieves the parent process ID
+// GetParentPID retrieves the parent process ID.
 func GetParentPID(pid uint32) uint32 {
-	proc, err := process.NewProcess(int32(pid))
+	p, err := process.NewProcess(int32(pid))
 	if err != nil {
 		return 0
 	}
-	ppid, err := proc.Ppid()
+	ppid, err := p.Ppid()
 	if err != nil {
 		return 0
 	}
 	return uint32(ppid)
 }
 
-// GetProcessNameByPID retrieves process name by PID
+// GetProcessNameByPID retrieves process name by PID.
 func GetProcessNameByPID(pid uint32) string {
-	proc, err := process.NewProcess(int32(pid))
+	p, err := process.NewProcess(int32(pid))
 	if err != nil {
 		return ""
 	}
-	name, err := proc.Name()
+	name, err := p.Name()
 	if err != nil {
 		return ""
 	}
 	return name
 }
 
-// IsProcessSigned checks if process is signed (simplified heuristic)
+// IsProcessSigned checks if a process executable is in a Windows system path.
+// This is a fast heuristic — full Authenticode verification is a Phase 3 item.
 func IsProcessSigned(pid uint32) bool {
 	exePath := GetExecutablePath(pid)
 	if exePath == "" || exePath == "unknown" {
 		return false
 	}
-	// Simplified: assume Windows system paths are signed
 	lower := strings.ToLower(exePath)
-	if strings.Contains(lower, `c:\windows\system32`) ||
-	   strings.Contains(lower, `c:\windows\syswow64`) {
-		return true
-	}
-	return false
+	return strings.Contains(lower, `c:\windows\system32`) ||
+		strings.Contains(lower, `c:\windows\syswow64`)
 }
 
-// ComputeFileSHA256 computes SHA256 hash of a file (with size limit)
+// ComputeFileSHA256 computes SHA256 hash of a file (with 100 MB size limit).
 func ComputeFileSHA256(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	
+
 	stat, err := file.Stat()
 	if err != nil {
 		return "", err
@@ -155,7 +194,7 @@ func ComputeFileSHA256(path string) (string, error) {
 	if stat.Size() > 100<<20 {
 		return "", fmt.Errorf("file too large: %d bytes", stat.Size())
 	}
-	
+
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, file); err != nil {
 		return "", err
@@ -163,41 +202,35 @@ func ComputeFileSHA256(path string) (string, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-// IsProcessAccessible checks if process can be queried
+// IsProcessAccessible checks if a process can be queried.
 func IsProcessAccessible(pid uint32) bool {
-	proc, err := process.NewProcess(int32(pid))
+	p, err := process.NewProcess(int32(pid))
 	if err != nil {
 		return false
 	}
-	_, err = proc.Name()
+	_, err = p.Name()
 	return err == nil
 }
 
-// GetProcessUser retrieves the user SID for a process (stub)
+// GetProcessUser retrieves the user SID string for a process.
 func GetProcessUser(pid uint32) string {
-	return GetProcessUserSID(pid) // or GetProcessUsername(pid) for "DOMAIN\User"
+	return GetProcessUserSID(pid)
 }
 
-
 // ============================================================================
-// GAP 1 — Username / Running User
+// Username / Running User
 // ============================================================================
 
 // GetProcessUsername returns "DOMAIN\User" for the given PID.
 func GetProcessUsername(pid uint32) string {
-	handle, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION,
-		false,
-		pid,
-	)
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return ""
 	}
 	defer windows.CloseHandle(handle)
 
 	var token windows.Token
-	err = windows.OpenProcessToken(handle, windows.TOKEN_QUERY, &token)
-	if err != nil {
+	if err := windows.OpenProcessToken(handle, windows.TOKEN_QUERY, &token); err != nil {
 		return ""
 	}
 	defer token.Close()
@@ -211,7 +244,6 @@ func GetProcessUsername(pid uint32) string {
 	if err != nil {
 		return tokenUser.User.Sid.String()
 	}
-
 	if domain != "" {
 		return domain + `\` + account
 	}
@@ -220,11 +252,7 @@ func GetProcessUsername(pid uint32) string {
 
 // GetProcessUserSID returns the raw SID string for the given PID.
 func GetProcessUserSID(pid uint32) string {
-	handle, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION,
-		false,
-		pid,
-	)
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return ""
 	}
@@ -244,38 +272,26 @@ func GetProcessUserSID(pid uint32) string {
 }
 
 // ============================================================================
-// GAP 2 — Real Process Start Time
+// Real Process Start Time
 // ============================================================================
 
-// GetProcessStartTime returns the real creation time of a process.
+// GetProcessStartTime returns the real kernel creation time of a process.
 func GetProcessStartTime(pid uint32) time.Time {
-	handle, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION,
-		false,
-		pid,
-	)
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return time.Time{}
 	}
 	defer windows.CloseHandle(handle)
 
 	var creation, exit, kernel, user windows.Filetime
-	err = windows.GetProcessTimes(
-		handle,
-		&creation,
-		&exit,
-		&kernel,
-		&user,
-	)
-	if err != nil {
+	if err := windows.GetProcessTimes(handle, &creation, &exit, &kernel, &user); err != nil {
 		return time.Time{}
 	}
-
 	return time.Unix(0, creation.Nanoseconds())
 }
 
 // ============================================================================
-// GAP 3 — File Size, Creation Time, Last Modified
+// File Metadata
 // ============================================================================
 
 // FileMetadata holds binary file attributes for process enrichment.
@@ -291,18 +307,15 @@ func GetFileMetadata(path string) (FileMetadata, bool) {
 	if path == "" || path == "unknown" {
 		return FileMetadata{}, false
 	}
-
 	info, err := os.Stat(path)
 	if err != nil {
 		return FileMetadata{}, false
 	}
-
 	meta := FileMetadata{
 		SizeBytes:    info.Size(),
 		SizeKB:       info.Size() / 1024,
 		ModifiedTime: info.ModTime(),
 	}
-
 	if sys, ok := info.Sys().(*syscall.Win32FileAttributeData); ok {
 		ft := sys.CreationTime
 		nsec := int64(ft.HighDateTime)<<32 | int64(ft.LowDateTime)
@@ -312,12 +325,11 @@ func GetFileMetadata(path string) (FileMetadata, bool) {
 			meta.CreationTime = time.Unix(0, nsec)
 		}
 	}
-
 	return meta, true
 }
 
 // ============================================================================
-// GAP 4 — Orphan Process Detection
+// Orphan Process Detection
 // ============================================================================
 
 // IsOrphanProcess returns true if the process's parent no longer exists.
@@ -329,18 +341,8 @@ func IsOrphanProcess(pid uint32, livePIDs map[uint32]bool) bool {
 	return !livePIDs[ppid]
 }
 
-// BuildLivePIDSet returns a set of all currently running PIDs.
-func BuildLivePIDSet() map[uint32]bool {
-	procs := GetProcesses()
-	set := make(map[uint32]bool, len(procs))
-	for _, p := range procs {
-		set[uint32(p.PID)] = true
-	}
-	return set
-}
-
 // ============================================================================
-// GAP 5 — Process Architecture (32-bit vs 64-bit)
+// Process Architecture
 // ============================================================================
 
 var (
@@ -348,13 +350,9 @@ var (
 	procIsWow64Process2 = modKernel32.NewProc("IsWow64Process2")
 )
 
-// GetProcessArchitecture returns "x64", "x86", or "unknown".
+// GetProcessArchitecture returns "x64", "x86", "arm64", or "unknown".
 func GetProcessArchitecture(pid uint32) string {
-	handle, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION,
-		false,
-		pid,
-	)
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return "unknown"
 	}
@@ -369,7 +367,6 @@ func GetProcessArchitecture(pid uint32) string {
 	if ret == 0 {
 		return "unknown"
 	}
-
 	switch processMachine {
 	case 0x014c:
 		return "x86"
@@ -377,7 +374,7 @@ func GetProcessArchitecture(pid uint32) string {
 		return "x64"
 	case 0xAA64:
 		return "arm64"
-	case 0x0000:
+	case 0x0000: // native machine, not emulated
 		switch nativeMachine {
 		case 0x8664:
 			return "x64"
@@ -386,4 +383,30 @@ func GetProcessArchitecture(pid uint32) string {
 		}
 	}
 	return "unknown"
+}
+
+
+// GetProcessNameFromSnapshot tries to get a process name using ToolHelp32
+// snapshot. Useful for processes that exit before gopsutil can query them.
+func GetProcessNameFromSnapshot(pid uint32) string {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(snap)
+
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	if err := windows.Process32First(snap, &entry); err != nil {
+		return ""
+	}
+	for {
+		if entry.ProcessID == pid {
+			return windows.UTF16ToString(entry.ExeFile[:])
+		}
+		if err := windows.Process32Next(snap, &entry); err != nil {
+			break
+		}
+	}
+	return ""
 }

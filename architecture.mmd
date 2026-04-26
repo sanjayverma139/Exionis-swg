@@ -1,0 +1,77 @@
+flowchart TD
+    subgraph External["External Systems"]
+        WIN["Windows Kernel ETW"]
+        REG["Windows Registry"]
+        FS["Filesystem / Binary Metadata"]
+        DNS["Reverse DNS"]
+        CLOUD["Cloud / SIEM Consumer"]
+    end
+
+    subgraph Phase1["Phase 1: Device Shadowing and Asset Intelligence"]
+        DID["utils/deviceid.go"]
+        INV["inventory/apps.go"]
+        APPS["Installed App Inventory"]
+    end
+
+    subgraph Phase2["Phase 2: Real-Time Process and Network Monitoring"]
+        PRIV["config/privilege.go"]
+        NETCFG["config/network.go"]
+        CBRIDGE["etw/etw_bridge.c"]
+        GOWRAP["etw/etw_native_engine.go"]
+        EVENTS["events/events.go"]
+    end
+
+    subgraph Correlation["Correlation and Enrichment"]
+        SNAP["Bootstrap Process Snapshot"]
+        ENGINE["correlation/engine.go"]
+        MODELS["correlation/models.go"]
+        PROC["process/collector.go"]
+        ENRICH["process_enrichment_update"]
+    end
+
+    subgraph Output["Output Pipeline"]
+        MIXED["logger/file_sink.go"]
+        OUTF["output/file_output.go"]
+        APPOUT["apps_*.ndjson"]
+        PROCOUT["processes_*.ndjson"]
+        NETOUT["network_*.ndjson"]
+        STDOUT["stdout NDJSON"]
+    end
+
+    REG --> INV
+    FS --> INV
+    DID --> APPS
+    INV --> APPS
+    APPS --> APPOUT
+    APPS --> MIXED
+    APPS --> STDOUT
+
+    PRIV --> CBRIDGE
+    NETCFG --> CBRIDGE
+    WIN --> CBRIDGE
+    CBRIDGE --> GOWRAP
+    GOWRAP --> EVENTS
+
+    PROC --> SNAP
+    SNAP --> ENGINE
+    EVENTS --> ENGINE
+    DNS --> ENGINE
+    FS --> ENGINE
+    MODELS --> ENGINE
+    ENGINE --> ENRICH
+
+    ENGINE --> MIXED
+    ENGINE --> OUTF
+    ENGINE --> STDOUT
+    ENRICH --> MIXED
+    ENRICH --> OUTF
+    ENRICH --> STDOUT
+
+    OUTF --> APPOUT
+    OUTF --> PROCOUT
+    OUTF --> NETOUT
+
+    MIXED --> CLOUD
+    APPOUT --> CLOUD
+    PROCOUT --> CLOUD
+    NETOUT --> CLOUD

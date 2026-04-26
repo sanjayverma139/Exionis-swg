@@ -1,0 +1,15 @@
+{
+    "IsAdmin":  true,
+    "ProcessNewLines":  0,
+    "NetworkNewLines":  0,
+    "LogNewLines":  0,
+    "ProcessTail":  [
+
+                    ],
+    "NetworkTail":  [
+
+                    ],
+    "LogTail":  [
+
+                ]
+}

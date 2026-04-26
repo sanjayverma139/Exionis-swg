@@ -15,10 +15,10 @@ type EventInput struct {
 	Opcode        uint8     `json:"opcode"`
 	Detail        string    `json:"detail"`
 	Timestamp     time.Time `json:"timestamp"`
-	DeviceID      string    `json:"device_id,omitempty"`       // ← NEW: Cloud sync
-	AgentVersion  string    `json:"agent_version,omitempty"`   // ← NEW: Version tracking
-	PolicyVersion string    `json:"policy_version,omitempty"`  // ← NEW: Policy tracking
-	Source        string    `json:"source,omitempty"`          // ← NEW: "etw" or "bootstrap"
+	DeviceID      string    `json:"device_id,omitempty"`      // ← NEW: Cloud sync
+	AgentVersion  string    `json:"agent_version,omitempty"`  // ← NEW: Version tracking
+	PolicyVersion string    `json:"policy_version,omitempty"` // ← NEW: Policy tracking
+	Source        string    `json:"source,omitempty"`         // ← NEW: "etw" or "bootstrap"
 }
 
 // NetworkEvent represents a parsed TCP/UDP event from ETW.
@@ -35,9 +35,9 @@ type NetworkEvent struct {
 	Timestamp     time.Time `json:"timestamp"`
 	Domain        string    `json:"domain,omitempty"`
 	Opcode        uint8     `json:"opcode"`
-	DeviceID      string    `json:"device_id,omitempty"`       // ← NEW: Cloud sync
-	AgentVersion  string    `json:"agent_version,omitempty"`   // ← NEW: Version tracking
-	PolicyVersion string    `json:"policy_version,omitempty"`  // ← NEW: Policy tracking
+	DeviceID      string    `json:"device_id,omitempty"`      // ← NEW: Cloud sync
+	AgentVersion  string    `json:"agent_version,omitempty"`  // ← NEW: Version tracking
+	PolicyVersion string    `json:"policy_version,omitempty"` // ← NEW: Policy tracking
 }
 
 // Global buffered channels for event distribution.
@@ -53,9 +53,12 @@ type NetworkOutputRecord struct {
 	Timestamp  string `json:"timestamp"`
 	PID        uint32 `json:"pid"`
 	Image      string `json:"image"`
+	LocalIP    string `json:"local_ip"`
 	RemoteIP   string `json:"remote_ip"`
+	LocalPort  uint16 `json:"local_port"`
 	RemotePort uint16 `json:"remote_port"`
 	Protocol   string `json:"protocol"`
+	Direction  string `json:"direction"`
 	Domain     string `json:"domain,omitempty"`
 	BytesSent  uint64 `json:"bytes_sent,omitempty"`
 	BytesRecv  uint64 `json:"bytes_recv,omitempty"`

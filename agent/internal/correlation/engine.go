@@ -18,34 +18,55 @@ import (
 	"exionis/internal/process"
 )
 
+// PIDHistoryEntry uniquely identifies a process instance by PID + StartTime.
+// Prevents PID reuse confusion (e.g., chrome.exe exits, malware.exe reuses same PID).
+type PIDHistoryEntry struct {
+	Name      string
+	StartTime time.Time
+	UpdatedAt time.Time
+}
+
 // ============================================================================
 // GLOBAL STATE & CONCURRENCY CONTROLS
 // ============================================================================
 var (
-	processTable      = make(map[uint32]*ProcessInfo)
-	tableMu           sync.RWMutex
-	pendingEvents     = make(map[uint32][]events.EventInput)
-	pendingMu         sync.Mutex
-	spawnAggregator   = make(map[string]*SpawnStats)
-	aggMu             sync.Mutex
-	sequenceCounter   uint64
-	seqMu             sync.Mutex
-	StructuredOutput  = make(chan StructuredEvent, 10000)
+	processTable    = make(map[uint32]*ProcessInfo)
+	tableMu         sync.RWMutex
+	pendingEvents   = make(map[uint32][]events.EventInput)
+	pendingMu       sync.Mutex
+	spawnAggregator = make(map[string]*SpawnStats)
+	aggMu           sync.Mutex
+	sequenceCounter uint64
+	seqMu           sync.Mutex
+	StructuredOutput = make(chan StructuredEvent, 10000)
 	aggregationWindow = 2 * time.Second
-	processTTL        = 5 * time.Minute
-	connectionTable   = make(map[uint32][]*ConnectionInfo)
-	connTableMu       sync.RWMutex
-	dnsCache          = make(map[string]dnsCacheEntry)
-	dnsCacheMu        sync.RWMutex
-	dnsCacheTTL       = 10 * time.Minute
-	hashCache         = make(map[string]string)
-	hashCacheMu       sync.RWMutex
-	hashCacheLimit    = 10000
 
-	// ✅ FIX 1: Async enrichment semaphore (limits concurrent hash ops)
+	// processTTL controls how long DEAD (IsAlive=false) process records are
+	// retained in the table before being evicted by the maintenance ticker.
+	// Only dead records are evicted — alive processes are never pruned by TTL.
+	processTTL = 10 * time.Minute
+
+	connectionTable = make(map[uint32][]*ConnectionInfo)
+	connTableMu     sync.RWMutex
+	dnsCache        = make(map[string]dnsCacheEntry)
+	dnsCacheMu      sync.RWMutex
+	dnsCacheTTL     = 10 * time.Minute
+	hashCache       = make(map[string]string)
+	hashCacheMu     sync.RWMutex
+	hashCacheLimit  = 10000
+
+	// enrichSem limits concurrent background enrichment goroutines (hash + path).
 	enrichSem = make(chan struct{}, 32)
-	// ✅ FIX 5: Hash computation semaphore (limits FD usage)
+	// hashSem limits concurrent file-open operations for SHA256 computation.
 	hashSem = make(chan struct{}, 10)
+
+	// legacyOutput is the package-level channel used by emitLegacyOutput.
+	legacyOutput   chan CorrelatedEvent
+	legacyOutputMu sync.RWMutex
+
+	// PID history cache for resolving process names after exit (PID reuse protection).
+	pidHistory   = make(map[uint32]PIDHistoryEntry)
+	pidHistoryMu sync.RWMutex
 )
 
 type dnsCacheEntry struct {
@@ -53,27 +74,30 @@ type dnsCacheEntry struct {
 	expires time.Time
 }
 
-// Engine is the main correlation processor
+// Engine is the main correlation processor.
 type Engine struct {
 	Output chan CorrelatedEvent
 	mu     sync.RWMutex
 }
 
-// New creates a new Engine instance
+// New creates a new Engine instance and registers its Output channel globally.
 func New() *Engine {
 	e := &Engine{Output: make(chan CorrelatedEvent, 5000)}
-	go e.cleanupAggregator() // ✅ FIX 4: Start aggregator eviction
+	legacyOutputMu.Lock()
+	legacyOutput = e.Output
+	legacyOutputMu.Unlock()
+	go e.cleanupAggregator()
 	return e
 }
 
-// RegistrySize returns current process table size (thread-safe)
+// RegistrySize returns current process table size (thread-safe).
 func (e *Engine) RegistrySize() int {
 	tableMu.RLock()
 	defer tableMu.RUnlock()
 	return len(processTable)
 }
 
-// GetActiveConnectionCount returns active connection count (thread-safe)
+// GetActiveConnectionCount returns active connection count (thread-safe).
 func GetActiveConnectionCount() int {
 	connTableMu.RLock()
 	defer connTableMu.RUnlock()
@@ -85,9 +109,53 @@ func GetActiveConnectionCount() int {
 }
 
 // ============================================================================
-// ✅ FIX 2: BOOTSTRAP PRE-EXISTING PROCESSES
+// PID HISTORY CACHE HELPERS (PID Reuse Protection)
 // ============================================================================
-// PopulateInitialProcessTable bootstraps the process table before ETW starts
+
+func rememberPIDName(pid uint32, name string, start time.Time) {
+	if pid == 0 || name == "" || name == "unknown" {
+		return
+	}
+	pidHistoryMu.Lock()
+	pidHistory[pid] = PIDHistoryEntry{
+		Name:      name,
+		StartTime: start,
+		UpdatedAt: time.Now(),
+	}
+	pidHistoryMu.Unlock()
+}
+
+func getRememberedPIDName(pid uint32) string {
+	pidHistoryMu.RLock()
+	defer pidHistoryMu.RUnlock()
+	entry, ok := pidHistory[pid]
+	if !ok {
+		return ""
+	}
+	// Reject stale cache entries (PID may have been reused by Windows)
+	if time.Since(entry.UpdatedAt) > 30*time.Minute {
+		return ""
+	}
+	return entry.Name
+}
+
+func cleanupPIDHistory() {
+	pidHistoryMu.Lock()
+	defer pidHistoryMu.Unlock()
+	now := time.Now()
+	for pid, entry := range pidHistory {
+		if now.Sub(entry.UpdatedAt) > 1*time.Hour {
+			delete(pidHistory, pid)
+		}
+	}
+}
+
+// ============================================================================
+// BOOTSTRAP: populate table with already-running processes before ETW fires
+// ============================================================================
+
+// PopulateInitialProcessTable bootstraps the process table before ETW starts.
+// Called once from main.go before StartETWListener().
 func PopulateInitialProcessTable() {
 	procs := process.GetProcesses()
 	livePIDs := process.BuildLivePIDSet()
@@ -99,17 +167,11 @@ func PopulateInitialProcessTable() {
 		if _, exists := processTable[uint32(p.PID)]; exists {
 			continue
 		}
-
-		// FIX: Get real process start time instead of fake time.Now()-1hour
 		startTime := process.GetProcessStartTime(uint32(p.PID))
 		if startTime.IsZero() {
 			startTime = time.Now().Add(-1 * time.Hour)
 		}
-
-		// FIX: Get real username
 		username := process.GetProcessUsername(uint32(p.PID))
-
-		// FIX: Detect orphan processes
 		isOrphan := process.IsOrphanProcess(uint32(p.PID), livePIDs)
 
 		proc := &ProcessInfo{
@@ -126,7 +188,6 @@ func PopulateInitialProcessTable() {
 				IsOrphan: isOrphan,
 			},
 		}
-
 		if parentPID := process.GetParentPID(uint32(p.PID)); parentPID > 0 {
 			proc.PPID = parentPID
 			if parent, ok := processTable[parentPID]; ok {
@@ -134,17 +195,21 @@ func PopulateInitialProcessTable() {
 				parent.Children = append(parent.Children, proc)
 			}
 		}
-
 		go enrichProcessAsync(proc, p.Name)
 		processTable[uint32(p.PID)] = proc
+		// BUG 3 + PID REUSE FIX: Cache name at bootstrap
+		rememberPIDName(uint32(p.PID), p.Name, startTime)
 	}
 }
 
-// Run starts the main event processing loop
+// ============================================================================
+// ENGINE MAIN LOOP
+// ============================================================================
+
+// Run starts the main event processing loop. Blocks until src is closed.
 func (e *Engine) Run(src <-chan events.EventInput) {
 	go runPendingResolver()
 	go runMaintenanceTicker()
-	go e.forwardToLegacyOutput()
 	go e.forwardNetworkEvents()
 
 	for ev := range src {
@@ -158,8 +223,9 @@ func (e *Engine) Run(src <-chan events.EventInput) {
 }
 
 // ============================================================================
-// MAINTENANCE & CLEANUP
+// MAINTENANCE
 // ============================================================================
+
 func runMaintenanceTicker() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -169,24 +235,6 @@ func runMaintenanceTicker() {
 		cleanupDNSCache()
 		cleanupHashCache()
 		cleanupSpawnAggregator()
-	}
-}
-
-func (e *Engine) forwardToLegacyOutput() {
-	for evt := range StructuredOutput {
-		legacy := CorrelatedEvent{
-			Type:        evt.EventType,
-			PID:         evt.PID,
-			Timestamp:   evt.Timestamp,
-			ProcessName: evt.Image,
-			ParentPID:   evt.PPID,
-			ParentName:  evt.ParentImage,
-			Summary:     fmt.Sprintf("%s (PID %d)", evt.Image, evt.PID),
-		}
-		select {
-		case e.Output <- legacy:
-		default:
-		}
 	}
 }
 
@@ -208,27 +256,42 @@ func (e *Engine) forwardNetworkEvents() {
 			conn := &ConnectionInfo{
 				RemoteIP:   netEvt.RemoteIP,
 				RemotePort: netEvt.RemotePort,
-				BytesSent:  netEvt.BytesSent,
 				Protocol:   netEvt.Protocol,
+				BytesSent:  netEvt.BytesSent,
 				BytesRecv:  netEvt.BytesRecv,
 				FirstSeen:  netEvt.Timestamp,
 				LastSeen:   netEvt.Timestamp,
 				Domain:     netEvt.Domain,
-				State:      mapOpcodeToConnectionState(uint8(netEvt.Opcode), netEvt.Protocol), // ✅ NEW
+				State:      mapOpcodeToConnectionState(uint8(netEvt.Opcode), netEvt.Protocol),
 			}
 			proc.UpsertConnection(conn)
 			connTableMu.Lock()
 			connectionTable[netEvt.PID] = append(connectionTable[netEvt.PID], conn)
 			connTableMu.Unlock()
 		}
+
+		// BUG 2 FIX: Ensure direction and local_ip are never empty
+		if netEvt.Direction == "" && netEvt.Protocol == "TCP" {
+			netEvt.Direction = mapOpcodeToDirection(netEvt.Opcode, netEvt.Protocol)
+		}
+		if netEvt.Direction == "" {
+			netEvt.Direction = "unknown"
+		}
+		if netEvt.LocalIP == "" {
+			netEvt.LocalIP = "0.0.0.0"
+		}
+		if netEvt.LocalPort == 0 {
+			netEvt.LocalPort = 0
+		}
+
 		emitNetworkEvent(netEvt, proc)
 	}
 }
 
 // ============================================================================
-// ✅ FIX 1: ASYNC ENRICHMENT PIPELINE
+// PROCESS START HANDLER
 // ============================================================================
-// HandleProcessStart processes PROCESS_START events
+
 func (e *Engine) HandleProcessStart(ev events.EventInput) {
 	seqMu.Lock()
 	seq := sequenceCounter
@@ -239,33 +302,35 @@ func (e *Engine) HandleProcessStart(ev events.EventInput) {
 	if imageName == "" || imageName == "<unknown>" {
 		imageName = resolveProcessImage(ev.PID)
 	}
+	cmdline := process.GetCmdline(ev.PID)
+	initialEnrichment := enrichProcessAtStart(ev.PID, imageName)
 
 	tableMu.Lock()
-	// Check if process already exists and is alive
 	if existing, ok := processTable[ev.PID]; ok && existing.IsAlive {
 		if existing.Image == "" && imageName != "" {
 			existing.Image = imageName
 		}
 		if existing.Cmdline == "" {
-			existing.Cmdline = process.GetCmdline(ev.PID)
+			existing.Cmdline = cmdline
+		}
+		if existing.Enrichment.ExecutablePath == "" && initialEnrichment.ExecutablePath != "" {
+			existing.Enrichment = initialEnrichment
+			existing.ImagePath = initialEnrichment.ExecutablePath
 		}
 		tableMu.Unlock()
 		return
 	}
 
-	// Create new process record (Stage 1: Fast, minimal)
 	proc := &ProcessInfo{
-		PID:       ev.PID,
-		PPID:      ppid,
-		Image:     imageName,
-		StartTime: ev.Timestamp,
-		IsAlive:   true,
-		Enrichment: ProcessEnrichment{
-			IsSystem: false, // Will be corrected async
-		},
+		PID:        ev.PID,
+		PPID:       ppid,
+		Image:      imageName,
+		Cmdline:    cmdline,
+		ImagePath:  initialEnrichment.ExecutablePath,
+		StartTime:  ev.Timestamp,
+		IsAlive:    true,
+		Enrichment: initialEnrichment,
 	}
-
-	// Link to parent if known
 	if ppid > 0 {
 		if parent, ok := processTable[ppid]; ok && parent.IsAlive {
 			proc.Parent = parent
@@ -273,29 +338,42 @@ func (e *Engine) HandleProcessStart(ev events.EventInput) {
 		}
 	}
 	processTable[ev.PID] = proc
+	// BUG 3 + PID REUSE FIX: Cache name at start event
+	rememberPIDName(ev.PID, imageName, ev.Timestamp)
 	tableMu.Unlock()
 
-	// ✅ FIX 1: Async enrichment (non-blocking)
 	go e.enrichAsync(ev.PID, imageName)
-
 	resolvePendingChildren(ev.PID)
 	emitProcessStart(proc, seq)
 }
 
-// HandleProcessStop processes PROCESS_STOP events
+// ============================================================================
+// PROCESS STOP HANDLER
+// ============================================================================
+
 func (e *Engine) HandleProcessStop(ev events.EventInput) {
 	tableMu.Lock()
 	proc, exists := processTable[ev.PID]
 
 	if !exists {
-		// Pre-existing process that we missed
-		imageName := resolveProcessImage(ev.PID)
-		if imageName == "unknown" {
-			imageName = "<pre-existing>"
+		// BUG 3 + PID REUSE FIX: Multi-stage name resolution with cache age check
+		resolvedName := process.GetProcessNameByPID(ev.PID)
+
+		if resolvedName == "" {
+			resolvedName = process.GetProcessNameFromSnapshot(ev.PID)
 		}
+
+		if resolvedName == "" {
+			resolvedName = getRememberedPIDName(ev.PID)
+		}
+
+		if resolvedName == "" {
+			resolvedName = "<pre-existing>"
+		}
+
 		proc = &ProcessInfo{
 			PID:       ev.PID,
-			Image:     imageName,
+			Image:     resolvedName,
 			StartTime: ev.Timestamp.Add(-1 * time.Second),
 			EndTime:   ev.Timestamp,
 			IsAlive:   false,
@@ -313,14 +391,12 @@ func (e *Engine) HandleProcessStop(ev events.EventInput) {
 	}
 	tableMu.Unlock()
 
-	// ✅ FIX 6: Stop-time fallback enrichment
 	if proc.Enrichment.ExecutablePath == "" {
 		go e.tryFallbackEnrichment(ev.PID, proc)
 	}
 
 	emitProcessStop(proc)
 
-	// Schedule cleanup after delay
 	go func(pid uint32) {
 		time.Sleep(2 * time.Second)
 		deleteProcessSafe(pid)
@@ -328,39 +404,60 @@ func (e *Engine) HandleProcessStop(ev events.EventInput) {
 }
 
 // ============================================================================
-// ✅ FIX 1: ASYNC ENRICHMENT WORKERS
+// ASYNC ENRICHMENT
 // ============================================================================
-// enrichAsync performs background enrichment with retry logic
-func (e *Engine) enrichAsync(pid uint32, imageName string) {
-	enrichSem <- struct{}{} // Acquire semaphore
-	go func() {
-		defer func() { <-enrichSem }() // Release semaphore
 
-		// Retry resolution (process may not be ready yet)
+func (e *Engine) enrichAsync(pid uint32, imageName string) {
+	go func() {
+		enrichSem <- struct{}{}
+		defer func() { <-enrichSem }()
+
 		exePath := e.retryResolvePath(pid, 5, 20*time.Millisecond)
 		if exePath == "" || exePath == "unknown" {
-			return // Give up if still not resolvable
+			exePath = parseExecutablePathFromCmdline(process.GetCmdline(pid))
+		}
+		if exePath == "" || exePath == "unknown" {
+			return
 		}
 
-		// Safe hash with size guard and FD throttling
 		var hash string
 		if stat, err := os.Stat(exePath); err == nil && stat.Size() <= 100<<20 {
 			hash = computeSHA256Safe(exePath)
 		}
 
-		// Update process record atomically
 		tableMu.Lock()
 		if proc, ok := processTable[pid]; ok && proc.IsAlive {
-			proc.Enrichment.ExecutablePath = exePath
-			proc.Enrichment.SHA256Hash = hash
-			proc.Enrichment.IsSystem = isSystemProcess(exePath) // ✅ FIX 3
-			proc.Enrichment.IsSigned = process.IsProcessSigned(pid)
+			changed := false
+			if proc.Enrichment.ExecutablePath != exePath || proc.ImagePath != exePath {
+				proc.Enrichment.ExecutablePath = exePath
+				proc.ImagePath = exePath
+				changed = true
+			}
+			if hash != "" && proc.Enrichment.SHA256Hash != hash {
+				proc.Enrichment.SHA256Hash = hash
+				changed = true
+			}
+			isSystem := isSystemProcess(exePath)
+			if proc.Enrichment.IsSystem != isSystem {
+				proc.Enrichment.IsSystem = isSystem
+				changed = true
+			}
+			isSigned := process.IsProcessSigned(pid)
+			if proc.Enrichment.IsSigned != isSigned {
+				proc.Enrichment.IsSigned = isSigned
+				changed = true
+			}
+			snapshot := *proc
+			tableMu.Unlock()
+			if changed {
+				emitProcessEnrichmentUpdate(&snapshot)
+			}
+			return
 		}
 		tableMu.Unlock()
 	}()
 }
 
-// retryResolvePath attempts to resolve executable path with retries
 func (e *Engine) retryResolvePath(pid uint32, attempts int, delay time.Duration) string {
 	for i := 0; i < attempts; i++ {
 		if path := process.GetExecutablePath(pid); path != "" && path != "unknown" {
@@ -373,7 +470,6 @@ func (e *Engine) retryResolvePath(pid uint32, attempts int, delay time.Duration)
 	return ""
 }
 
-// enrichProcessAsync is the legacy helper (kept for bootstrap compatibility)
 func enrichProcessAsync(proc *ProcessInfo, imageName string) {
 	enrichment := enrichProcessAtStart(proc.PID, imageName)
 	tableMu.Lock()
@@ -386,12 +482,17 @@ func enrichProcessAsync(proc *ProcessInfo, imageName string) {
 	tableMu.Unlock()
 }
 
-// enrichProcessAtStart performs synchronous enrichment (legacy, for bootstrap only)
 func enrichProcessAtStart(pid uint32, imageName string) ProcessEnrichment {
 	enrich := ProcessEnrichment{IsSystem: false}
-	if exePath := process.GetExecutablePathWithRetry(pid, 3); exePath != "" && exePath != "unknown" {
+	if exePath := process.GetExecutablePathWithRetry(pid, 10); exePath != "" && exePath != "unknown" {
 		enrich.ExecutablePath = exePath
-		enrich.IsSystem = isSystemProcess(exePath) // ✅ FIX 3
+		enrich.IsSystem = isSystemProcess(exePath)
+	}
+	if enrich.ExecutablePath == "" {
+		if exePath := parseExecutablePathFromCmdline(process.GetCmdline(pid)); exePath != "" {
+			enrich.ExecutablePath = exePath
+			enrich.IsSystem = isSystemProcess(exePath)
+		}
 	}
 	if enrich.ExecutablePath != "" {
 		if hash, err := computeFileSHA256(enrich.ExecutablePath); err == nil {
@@ -399,37 +500,65 @@ func enrichProcessAtStart(pid uint32, imageName string) ProcessEnrichment {
 		}
 	}
 	enrich.IsSigned = process.IsProcessSigned(pid)
-	enrich.Username = process.GetProcessUsername(pid) // ✅ Real username
-	enrich.UserSID = process.GetProcessUserSID(pid)   // ✅ Real SID
+	enrich.Username = process.GetProcessUsername(pid)
+	enrich.UserSID = process.GetProcessUserSID(pid)
 	return enrich
 }
 
-// ============================================================================
-// ✅ FIX 6: FALLBACK ENRICHMENT ON STOP
-// ============================================================================
-// tryFallbackEnrichment attempts enrichment when process is stopping
-func (e *Engine) tryFallbackEnrichment(pid uint32, proc *ProcessInfo) {
-	if path := process.GetExecutablePath(pid); path != "" && path != "unknown" {
-		hash := computeSHA256Safe(path)
-
-		tableMu.Lock()
-		if p, ok := processTable[pid]; ok {
-			if p.Enrichment.ExecutablePath == "" {
-				p.Enrichment.ExecutablePath = path
-				p.Enrichment.SHA256Hash = hash
-				p.Enrichment.IsSystem = isSystemProcess(path) // ✅ FIX 3
-			}
-		}
-		tableMu.Unlock()
+func parseExecutablePathFromCmdline(cmdline string) string {
+	cmdline = strings.TrimSpace(cmdline)
+	if cmdline == "" {
+		return ""
 	}
+	var candidate string
+	if strings.HasPrefix(cmdline, `"`) {
+		trimmed := strings.TrimPrefix(cmdline, `"`)
+		if idx := strings.Index(trimmed, `"`); idx >= 0 {
+			candidate = trimmed[:idx]
+		}
+	} else {
+		candidate = strings.Fields(cmdline)[0]
+	}
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return ""
+	}
+	if _, err := os.Stat(candidate); err != nil {
+		return ""
+	}
+	return candidate
+}
+
+func (e *Engine) tryFallbackEnrichment(pid uint32, proc *ProcessInfo) {
+	path := process.GetExecutablePath(pid)
+	if path == "" || path == "unknown" {
+		path = parseExecutablePathFromCmdline(proc.Cmdline)
+	}
+	if path == "" || path == "unknown" {
+		return
+	}
+	hash := computeSHA256Safe(path)
+	tableMu.Lock()
+	if p, ok := processTable[pid]; ok {
+		if p.Enrichment.ExecutablePath == "" {
+			p.Enrichment.ExecutablePath = path
+			p.ImagePath = path
+			p.Enrichment.SHA256Hash = hash
+			p.Enrichment.IsSystem = isSystemProcess(path)
+		}
+		snap := *p
+		tableMu.Unlock()
+		emitProcessEnrichmentUpdate(&snap)
+		return
+	}
+	tableMu.Unlock()
 }
 
 // ============================================================================
 // EVENT EMITTERS
 // ============================================================================
+
 func emitProcessStart(proc *ProcessInfo, seq uint64) {
-	// FIX: resolve parent_image from table directly, not just proc.Parent pointer
-	// proc.Parent can be nil due to async timing even when parent exists in table
 	parentImage := ""
 	if proc.Parent != nil && proc.Parent.Image != "" {
 		parentImage = proc.Parent.Image
@@ -449,6 +578,7 @@ func emitProcessStart(proc *ProcessInfo, seq uint64) {
 		ParentImage: parentImage,
 		Cmdline:     proc.Cmdline,
 		ImagePath:   proc.Enrichment.ExecutablePath,
+		IsAlive:     true,
 		Resolved:    true,
 		Enrichment:  proc.Enrichment,
 		SequenceID:  seq,
@@ -470,28 +600,56 @@ func emitProcessStop(proc *ProcessInfo) {
 		PID:        proc.PID,
 		Image:      proc.Image,
 		DurationMs: duration,
+		IsAlive:    false,
 		Resolved:   true,
 		Enrichment: proc.Enrichment,
 	}
 	nonBlockingEmit(evt)
 }
 
+func emitProcessEnrichmentUpdate(proc *ProcessInfo) {
+	parentImage := ""
+	if proc.Parent != nil && proc.Parent.Image != "" {
+		parentImage = proc.Parent.Image
+	} else if proc.PPID > 0 {
+		tableMu.RLock()
+		if parent, ok := processTable[proc.PPID]; ok {
+			parentImage = parent.Image
+		}
+		tableMu.RUnlock()
+	}
+	nonBlockingEmit(StructuredEvent{
+		EventType:   "process_enrichment_update",
+		Timestamp:   time.Now(),
+		PID:         proc.PID,
+		PPID:        proc.PPID,
+		Image:       proc.Image,
+		ParentImage: parentImage,
+		Cmdline:     proc.Cmdline,
+		ImagePath:   proc.ImagePath,
+		IsAlive:     proc.IsAlive,
+		Resolved:    true,
+		Enrichment:  proc.Enrichment,
+	})
+}
+
+// BUG 1 FIX: emitNetworkEvent ONLY prints to stdout and sends to events.NetworkOutputChan
 func emitNetworkEvent(evt events.NetworkEvent, proc *ProcessInfo) {
 	imageName := "unknown"
 	if proc != nil && proc.Image != "" {
 		imageName = proc.Image
-	} else {
-		// 🔄 Fallback: Directly query Windows if our internal cache missed the process
-		if resolved := process.GetProcessNameByPID(evt.PID); resolved != "" {
-			imageName = resolved
-		}
+	} else if resolved := process.GetProcessNameByPID(evt.PID); resolved != "" {
+		imageName = resolved
 	}
+
 	output := map[string]interface{}{
 		"event_type":  "network_connection",
 		"timestamp":   evt.Timestamp.Format(time.RFC3339Nano),
 		"pid":         evt.PID,
 		"image":       imageName,
+		"local_ip":    evt.LocalIP,
 		"remote_ip":   evt.RemoteIP,
+		"local_port":  evt.LocalPort,
 		"remote_port": evt.RemotePort,
 		"protocol":    evt.Protocol,
 		"direction":   evt.Direction,
@@ -510,27 +668,19 @@ func emitNetworkEvent(evt events.NetworkEvent, proc *ProcessInfo) {
 		fmt.Fprintf(os.Stderr, "[Exionis] JSON marshal error: %v\n", err)
 		return
 	}
-	select {
-	case StructuredOutput <- StructuredEvent{
-		EventType: "network_connection",
-		Timestamp: evt.Timestamp,
-		PID:       evt.PID,
-		Image:     imageName,
-		Resolved:  true,
-	}:
-	default:
-	}
 	fmt.Printf("%s\n", string(jsonBytes))
 
-	// 🔥 Send to network output file channel (non-blocking)
 	select {
 	case events.NetworkOutputChan <- events.NetworkOutputRecord{
 		Timestamp:  evt.Timestamp.Format(time.RFC3339Nano),
 		PID:        evt.PID,
 		Image:      imageName,
+		LocalIP:    evt.LocalIP,
 		RemoteIP:   evt.RemoteIP,
+		LocalPort:  evt.LocalPort,
 		RemotePort: evt.RemotePort,
 		Protocol:   evt.Protocol,
+		Direction:  evt.Direction,
 		Domain:     evt.Domain,
 		BytesSent:  evt.BytesSent,
 		BytesRecv:  evt.BytesRecv,
@@ -538,19 +688,38 @@ func emitNetworkEvent(evt events.NetworkEvent, proc *ProcessInfo) {
 	}:
 	default:
 	}
-	// 🔥 Force Windows to flush stdout so piped commands (findstr, SIEM, etc.) see it instantly
 	syscall.FlushFileBuffers(syscall.Handle(os.Stdout.Fd()))
 }
 
 func nonBlockingEmit(evt StructuredEvent) {
-	// Print to stdout immediately
 	if jsonBytes, err := json.Marshal(evt); err == nil {
 		fmt.Printf("%s\n", string(jsonBytes))
 	}
-	// Send to StructuredOutput for file sink in main.go (non-blocking)
-	// main.go goroutine writes to FILE ONLY — it does NOT print to stdout
+	emitLegacyOutput(evt)
 	select {
 	case StructuredOutput <- evt:
+	default:
+	}
+}
+
+func emitLegacyOutput(evt StructuredEvent) {
+	legacyOutputMu.RLock()
+	out := legacyOutput
+	legacyOutputMu.RUnlock()
+	if out == nil {
+		return
+	}
+	legacy := CorrelatedEvent{
+		Type:        evt.EventType,
+		PID:         evt.PID,
+		Timestamp:   evt.Timestamp,
+		ProcessName: evt.Image,
+		ParentPID:   evt.PPID,
+		ParentName:  evt.ParentImage,
+		Summary:     fmt.Sprintf("%s (PID %d)", evt.Image, evt.PID),
+	}
+	select {
+	case out <- legacy:
 	default:
 	}
 }
@@ -558,6 +727,7 @@ func nonBlockingEmit(evt StructuredEvent) {
 // ============================================================================
 // PENDING CHILD RESOLUTION
 // ============================================================================
+
 func resolvePendingChildren(parentPID uint32) {
 	pendingMu.Lock()
 	children, ok := pendingEvents[parentPID]
@@ -579,9 +749,7 @@ func resolvePendingChildren(parentPID uint32) {
 	}
 }
 
-// HandleProcessStartWrapper allows external calls to HandleProcessStart
 func HandleProcessStartWrapper(ev events.EventInput) {
-	// Create a dummy engine for standalone calls
 	e := &Engine{}
 	e.HandleProcessStart(ev)
 }
@@ -600,6 +768,7 @@ func runPendingResolver() {
 		}
 		tableMu.RUnlock()
 		pendingMu.Unlock()
+
 		for _, ppid := range toResolve {
 			resolvePendingChildren(ppid)
 		}
@@ -607,8 +776,9 @@ func runPendingResolver() {
 }
 
 // ============================================================================
-// ✅ FIX 4: AGGREGATION WITH EVICTION
+// AGGREGATION
 // ============================================================================
+
 func shouldAggregate(evt StructuredEvent) bool {
 	if evt.EventType != "process_start" {
 		return false
@@ -629,7 +799,7 @@ func shouldAggregate(evt StructuredEvent) bool {
 			ParentImage: evt.ParentImage,
 			ChildImage:  evt.Image,
 			FirstSeen:   now,
-			LastSeen:    now, // ← Critical for eviction
+			LastSeen:    now,
 			Count:       1,
 			WindowStart: now,
 		}
@@ -663,7 +833,6 @@ func emitAggregationSummary(stats *SpawnStats) {
 	})
 }
 
-// ✅ FIX 4: Aggregator cleanup goroutine
 func (e *Engine) cleanupAggregator() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -690,8 +859,9 @@ func isCriticalProcess(image string) bool {
 }
 
 // ============================================================================
-// HELPER FUNCTIONS
+// HELPERS
 // ============================================================================
+
 func parseProcessDetail(detail string) (ppid uint32, imageName string) {
 	for _, tok := range strings.Fields(detail) {
 		if strings.HasPrefix(tok, "PPID:") {
@@ -750,16 +920,12 @@ func ResolveDomain(ip string) string {
 	select {
 	case domain := <-done:
 		dnsCacheMu.Lock()
-		dnsCache[ip] = dnsCacheEntry{
-			domain:  domain,
-			expires: time.Now().Add(dnsCacheTTL),
-		}
+		dnsCache[ip] = dnsCacheEntry{domain: domain, expires: time.Now().Add(dnsCacheTTL)}
 		if len(dnsCache) > 5000 {
 			count := 0
 			for k := range dnsCache {
 				delete(dnsCache, k)
-				count++
-				if count >= 500 {
+				if count++; count >= 500 {
 					break
 				}
 			}
@@ -771,23 +937,13 @@ func ResolveDomain(ip string) string {
 	}
 }
 
-func cleanupDNSCache() {
-	dnsCacheMu.Lock()
-	defer dnsCacheMu.Unlock()
-	now := time.Now()
-	for ip, entry := range dnsCache {
-		if now.After(entry.expires) {
-			delete(dnsCache, ip)
-		}
-	}
-}
+// ============================================================================
+// SHA256
+// ============================================================================
 
-// ============================================================================
-// ✅ FIX 5: SAFE SHA256 WITH FD THROTTLING
-// ============================================================================
 func computeSHA256Safe(path string) string {
-	hashSem <- struct{}{}        // Acquire semaphore
-	defer func() { <-hashSem }() // Release semaphore
+	hashSem <- struct{}{}
+	defer func() { <-hashSem }()
 
 	file, err := os.Open(path)
 	if err != nil {
@@ -796,10 +952,7 @@ func computeSHA256Safe(path string) string {
 	defer file.Close()
 
 	stat, err := file.Stat()
-	if err != nil {
-		return ""
-	}
-	if stat.Size() > 100<<20 {
+	if err != nil || stat.Size() > 100<<20 {
 		return ""
 	}
 
@@ -844,47 +997,18 @@ func computeFileSHA256(path string) (string, error) {
 		count := 0
 		for k := range hashCache {
 			delete(hashCache, k)
-			count++
-			if count >= hashCacheLimit/10 {
+			if count++; count >= hashCacheLimit/10 {
 				break
 			}
 		}
 	}
 	hashCacheMu.Unlock()
-
 	return hash, nil
 }
 
-func cleanupHashCache() {
-	hashCacheMu.Lock()
-	defer hashCacheMu.Unlock()
-	if len(hashCache) > hashCacheLimit*8/10 {
-		count := 0
-		for k := range hashCache {
-			delete(hashCache, k)
-			count++
-			if count >= hashCacheLimit/5 {
-				break
-			}
-		}
-	}
-}
-
 // ============================================================================
-// ✅ FIX 3: CORRECT SYSTEM PROCESS DETECTION
+// CLEANUP
 // ============================================================================
-func isSystemProcess(imagePath string) bool {
-	if imagePath == "" {
-		return false
-	}
-	// Normalize path separators for reliable matching
-	normalized := strings.ToLower(strings.ReplaceAll(imagePath, "/", "\\"))
-
-	// Check for Windows system directories (case-insensitive)
-	return strings.Contains(normalized, `c:\windows\system32`) ||
-		strings.Contains(normalized, `c:\windows\syswow64`) ||
-		strings.Contains(normalized, `\systemroot\`)
-}
 
 func cleanupStaleProcesses() {
 	tableMu.Lock()
@@ -893,13 +1017,10 @@ func cleanupStaleProcesses() {
 	for pid, proc := range processTable {
 		if !proc.IsAlive && now.Sub(proc.EndTime) > processTTL {
 			delete(processTable, pid)
-		} else if proc.IsAlive && now.Sub(proc.StartTime) > processTTL {
-			proc.IsAlive = false
-			proc.EndTime = now
-			emitProcessStop(proc)
-			delete(processTable, pid)
 		}
 	}
+	// PID REUSE FIX: Clean up stale PID history entries
+	cleanupPIDHistory()
 }
 
 func cleanupStaleConnections() {
@@ -921,6 +1042,31 @@ func cleanupStaleConnections() {
 	}
 }
 
+func cleanupDNSCache() {
+	dnsCacheMu.Lock()
+	defer dnsCacheMu.Unlock()
+	now := time.Now()
+	for ip, entry := range dnsCache {
+		if now.After(entry.expires) {
+			delete(dnsCache, ip)
+		}
+	}
+}
+
+func cleanupHashCache() {
+	hashCacheMu.Lock()
+	defer hashCacheMu.Unlock()
+	if len(hashCache) > hashCacheLimit*8/10 {
+		count := 0
+		for k := range hashCache {
+			delete(hashCache, k)
+			if count++; count >= hashCacheLimit/5 {
+				break
+			}
+		}
+	}
+}
+
 func cleanupSpawnAggregator() {
 	aggMu.Lock()
 	defer aggMu.Unlock()
@@ -932,7 +1078,7 @@ func cleanupSpawnAggregator() {
 	}
 }
 
-// Thread-safe process table accessors
+// Thread-safe process table accessors.
 func getProcessSafe(pid uint32) (*ProcessInfo, bool) {
 	tableMu.RLock()
 	defer tableMu.RUnlock()
@@ -952,38 +1098,64 @@ func deleteProcessSafe(pid uint32) {
 	delete(processTable, pid)
 }
 
-func resolveProcessSID(pid uint32) string {
-	return ""
+func resolveProcessSID(pid uint32) string { return "" }
+
+// ============================================================================
+// SYSTEM PROCESS DETECTION
+// ============================================================================
+
+func isSystemProcess(imagePath string) bool {
+	if imagePath == "" {
+		return false
+	}
+	normalized := strings.ToLower(strings.ReplaceAll(imagePath, "/", `\`))
+	return strings.Contains(normalized, `c:\windows\system32`) ||
+		strings.Contains(normalized, `c:\windows\syswow64`) ||
+		strings.Contains(normalized, `\systemroot\`)
 }
 
 // ============================================================================
-// ✅ CONNECTION STATE MAPPING HELPER
+// CONNECTION STATE MAPPING
 // ============================================================================
-// mapOpcodeToConnectionState maps ETW opcodes to our ConnectionState enum
+
 func mapOpcodeToConnectionState(opcode uint8, protocol string) ConnectionState {
 	if protocol != "TCP" {
-		return StateUnknown // UDP is connectionless
+		return StateUnknown
 	}
-
-	// ETW opcode constants (from evntcons.h)
 	const (
-		EVENT_TRACE_TYPE_CONNECT    = 10
-		EVENT_TRACE_TYPE_ACCEPT     = 11
-		EVENT_TRACE_TYPE_RECONNECT  = 12
-		EVENT_TRACE_TYPE_SEND       = 13
-		EVENT_TRACE_TYPE_RECEIVE    = 14
-		EVENT_TRACE_TYPE_DISCONNECT = 15
-		EVENT_TRACE_TYPE_RETRANSMIT = 16
+		opcodeConnect    = 10
+		opcodeAccept     = 11
+		opcodeReconnect  = 12
+		opcodeSend       = 13
+		opcodeReceive    = 14
+		opcodeDisconnect = 15
+		opcodeRetransmit = 16
 	)
-
 	switch opcode {
-	case EVENT_TRACE_TYPE_CONNECT, EVENT_TRACE_TYPE_ACCEPT, EVENT_TRACE_TYPE_RECONNECT:
+	case opcodeConnect, opcodeAccept, opcodeReconnect, opcodeSend, opcodeReceive, opcodeRetransmit:
 		return StateEstablished
-	case EVENT_TRACE_TYPE_DISCONNECT:
+	case opcodeDisconnect:
 		return StateClosed
-	case EVENT_TRACE_TYPE_SEND, EVENT_TRACE_TYPE_RECEIVE, EVENT_TRACE_TYPE_RETRANSMIT:
-		return StateEstablished // Active data transfer
 	default:
 		return StateNew
+	}
+}
+
+// BUG 2 FIX: Helper to map opcode to direction for TCP events (uint8 signature)
+func mapOpcodeToDirection(opcode uint8, protocol string) string {
+	if protocol != "TCP" {
+		return "unknown"
+	}
+	const (
+		opcodeConnect uint8 = 10
+		opcodeAccept  uint8 = 11
+	)
+	switch opcode {
+	case opcodeConnect:
+		return "outbound"
+	case opcodeAccept:
+		return "inbound"
+	default:
+		return "unknown"
 	}
 }

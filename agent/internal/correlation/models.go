@@ -63,6 +63,7 @@ type StructuredEvent struct {
 	Cmdline     string            `json:"cmdline,omitempty"`
 	ImagePath   string            `json:"image_path,omitempty"`
 	DurationMs  int64             `json:"duration_ms,omitempty"`
+	IsAlive     bool              `json:"is_alive"`
 	Resolved    bool              `json:"resolved"`
 	Enrichment  ProcessEnrichment `json:"enrichment,omitempty"`
 	SequenceID  uint64            `json:"-"`

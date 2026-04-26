@@ -1,4 +1,3 @@
-// Package etw provides the CGO bridge between Windows ETW C consumer and Go.
 package etw
 
 /*
@@ -10,11 +9,11 @@ import "C"
 import (
 	"fmt"
 	"time"
+
 	"exionis/internal/config"
 	"exionis/internal/events"
 )
 
-// export exionis_go_emit_event is called from C when a process event occurs.
 //export exionis_go_emit_event
 func exionis_go_emit_event(
 	pid C.uint,
@@ -46,7 +45,6 @@ func exionis_go_emit_event(
 	}
 }
 
-// export exionis_go_emit_network_event is called from C when a network event occurs.
 //export exionis_go_emit_network_event
 func exionis_go_emit_network_event(
 	pid C.uint,
@@ -64,21 +62,22 @@ func exionis_go_emit_network_event(
 	unixNano := int64(uint64(timestamp)-116444736000000000) * 100
 	ts := time.Unix(0, unixNano)
 
-	
+	proto := C.GoString(protocol)
+	op := uint8(opcode)
 
 	evt := events.NetworkEvent{
-	PID:        uint32(pid),
-	LocalIP:    C.GoString(localIP),
-	RemoteIP:   C.GoString(remoteIP),
-	LocalPort:  uint16(localPort),
-	RemotePort: uint16(remotePort),
-	Protocol:   C.GoString(protocol),
-	Direction:  mapOpcodeToDirection(uint8(opcode), C.GoString(protocol)),
-	BytesSent:  uint64(bytesSent),
-	BytesRecv:  uint64(bytesRecv),
-	Timestamp:  ts,
-	Opcode:     uint8(opcode), // ✅ NEW: Pass opcode for state mapping
-}
+		PID:        uint32(pid),
+		LocalIP:    C.GoString(localIP),
+		RemoteIP:   C.GoString(remoteIP),
+		LocalPort:  uint16(localPort),
+		RemotePort: uint16(remotePort),
+		Protocol:   proto,
+		Direction:  mapOpcodeToDirection(op, proto),
+		BytesSent:  uint64(bytesSent),
+		BytesRecv:  uint64(bytesRecv),
+		Timestamp:  ts,
+		Opcode:     op,
+	}
 
 	select {
 	case events.NetworkChan <- evt:
@@ -86,34 +85,47 @@ func exionis_go_emit_network_event(
 	}
 }
 
-// export go_is_internal_ip checks if an IP is internal (called from C)
 //export go_is_internal_ip
 func go_is_internal_ip(ip *C.char) C.int {
-	ipStr := C.GoString(ip)
-	if config.IsInternalIP(ipStr) {
-		return 1 // true: skip this event
+	if config.IsInternalIP(C.GoString(ip)) {
+		return 1
 	}
-	return 0 // false: emit event
+	return 0
 }
 
+// mapOpcodeToDirection converts an ETW TCP/IP opcode to a human-readable direction.
+//
+// ETW kernel TCP/IP provider opcodes (evntcons.h):
+//   10 = Connect    — client initiates outbound connection
+//   11 = Accept     — server accepts inbound connection
+//   12 = Reconnect  — client reconnects (also outbound)
+//   13 = Send       — local side is sending data (outbound)
+//   14 = Receive    — local side is receiving data (inbound)
+//   15 = Disconnect — connection torn down (direction not meaningful)
+//   16 = Retransmit — retransmitting sent data (outbound)
+//
+// FIX: previous code had opcode 13 (Send) mapped to "inbound" and
+// opcode 14 (Receive) falling through to "unknown". Both were wrong.
 func mapOpcodeToDirection(opcode uint8, protocol string) string {
 	if protocol != "TCP" {
 		return "unknown"
 	}
 	switch opcode {
-	case 10, 12: return "outbound" // Connect, Send
-	case 11, 13: return "inbound"  // Accept, Receive
-	default:     return "unknown"
+	case 10, 12, 13, 16: // Connect, Reconnect, Send, Retransmit
+		return "outbound"
+	case 11, 14: // Accept, Receive
+		return "inbound"
+	default:
+		return "unknown"
 	}
 }
 
 // StartETWListener initializes and starts the ETW kernel trace session.
 func StartETWListener() error {
-	// ✅ Initialize internal IP filtering config
 	if err := config.InitNetworkConfig(config.DefaultInternalRanges()); err != nil {
 		return fmt.Errorf("failed to init network config: %w", err)
 	}
-	
+
 	status := C.exionis_start_kernel_trace()
 	if status != 0 && status != C.ERROR_ALREADY_EXISTS {
 		return &ETWError{Code: int(status), Message: "failed to start kernel trace"}
@@ -135,4 +147,5 @@ type ETWError struct {
 	Code    int
 	Message string
 }
+
 func (e *ETWError) Error() string { return e.Message }
