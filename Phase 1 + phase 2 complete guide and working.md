@@ -1,4 +1,5 @@
-```flowchart TD
+```mermaid
+flowchart TD
     %% ===== PHASE 1: INITIALIZATION & ASSET INTELLIGENCE =====
     subgraph Phase1["🟦 Phase 1: Device Shadowing & Asset Intelligence"]
         A1["🚀 Start Agent"] --> A2["🔐 Enable Privileges\nSeSystemProfile\nSeDebug"]
