@@ -10,7 +10,6 @@ import "C"
 import (
 	"fmt"
 	"time"
-
 	"exionis/internal/config"
 	"exionis/internal/events"
 )
@@ -64,6 +63,8 @@ func exionis_go_emit_network_event(
 ) {
 	unixNano := int64(uint64(timestamp)-116444736000000000) * 100
 	ts := time.Unix(0, unixNano)
+
+	
 
 	evt := events.NetworkEvent{
 	PID:        uint32(pid),

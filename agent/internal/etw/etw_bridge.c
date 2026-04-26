@@ -157,16 +157,45 @@ static void format_ip(const UCHAR* ip, USHORT family, char* out, size_t out_size
 static int exionis_extract_network_fields(const BYTE* data, ULONG datalen, ULONG* pid,
     char* local_ip, size_t local_ip_size, char* remote_ip, size_t remote_ip_size,
     USHORT* local_port, USHORT* remote_port, USHORT* family, ULONGLONG* bytes) {
-    if (datalen < 56) return 0;
-    memcpy(pid, data, sizeof(ULONG));
-    memcpy(family, data + 36, sizeof(USHORT));
-    memcpy(local_port, data + 32, sizeof(USHORT));
-    memcpy(remote_port, data + 34, sizeof(USHORT));
-    *local_port = ntohs(*local_port);
-    *remote_port = ntohs(*remote_port);
-    format_ip(data + 40, *family, local_ip, local_ip_size);
-    format_ip(data + 56, *family, remote_ip, remote_ip_size);
-    if (bytes && datalen >= 28) { memcpy(bytes, data + 24, sizeof(ULONG)); }
+
+    /* NT Kernel Logger TCP/IP MOF IPv4 layout:
+     * offset 0  ULONG  PID
+     * offset 4  ULONG  bytes transferred
+     * offset 8  ULONG  daddr (dest IP, network byte order)
+     * offset 12 ULONG  saddr (src IP, network byte order)
+     * offset 16 USHORT dport (dest port, network byte order)
+     * offset 18 USHORT sport (src port, network byte order)
+     * Minimum: 20 bytes */
+    if (data == NULL || datalen < 20) return 0;
+
+    memcpy(pid, data + 0, sizeof(ULONG));
+
+    if (bytes) {
+        ULONG sz = 0;
+        memcpy(&sz, data + 4, sizeof(ULONG));
+        *bytes = (ULONGLONG)sz;
+    }
+
+    ULONG daddr = 0, saddr = 0;
+    memcpy(&daddr, data + 8,  sizeof(ULONG));
+    memcpy(&saddr, data + 12, sizeof(ULONG));
+
+    struct in_addr da, sa;
+    da.s_addr = daddr;
+    sa.s_addr = saddr;
+    
+    if (inet_ntop(AF_INET, &da, remote_ip, (socklen_t)remote_ip_size) == NULL)
+        remote_ip[0] = '\0';
+    if (inet_ntop(AF_INET, &sa, local_ip, (socklen_t)local_ip_size) == NULL)
+        local_ip[0] = '\0';
+
+    USHORT dp = 0, sp = 0;
+    memcpy(&dp, data + 16, sizeof(USHORT));
+    memcpy(&sp, data + 18, sizeof(USHORT));
+    *remote_port = ntohs(dp);
+    *local_port  = ntohs(sp);
+    *family = 2; /* Always IPv4 for this layout */
+
     return 1;
 }
 
@@ -301,6 +330,7 @@ static VOID WINAPI exionis_event_record_callback(PEVENT_RECORD record) {
         if (exionis_is_internal_ip(remote_ip)) { 
             return; // Skip internal traffic if configured
         }
+        
         exionis_go_emit_network_event(pid, record->EventHeader.ThreadId, opcode,
             (unsigned long long)record->EventHeader.TimeStamp.QuadPart,
             local_ip, remote_ip, local_port, remote_port, (char*)protocol,

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"exionis/internal/events"
@@ -21,15 +22,15 @@ import (
 // GLOBAL STATE & CONCURRENCY CONTROLS
 // ============================================================================
 var (
-	processTable    = make(map[uint32]*ProcessInfo)
-	tableMu         sync.RWMutex
-	pendingEvents   = make(map[uint32][]events.EventInput)
-	pendingMu       sync.Mutex
-	spawnAggregator = make(map[string]*SpawnStats)
-	aggMu           sync.Mutex
-	sequenceCounter uint64
-	seqMu           sync.Mutex
-	StructuredOutput = make(chan StructuredEvent, 10000)
+	processTable      = make(map[uint32]*ProcessInfo)
+	tableMu           sync.RWMutex
+	pendingEvents     = make(map[uint32][]events.EventInput)
+	pendingMu         sync.Mutex
+	spawnAggregator   = make(map[string]*SpawnStats)
+	aggMu             sync.Mutex
+	sequenceCounter   uint64
+	seqMu             sync.Mutex
+	StructuredOutput  = make(chan StructuredEvent, 10000)
 	aggregationWindow = 2 * time.Second
 	processTTL        = 5 * time.Minute
 	connectionTable   = make(map[uint32][]*ConnectionInfo)
@@ -40,7 +41,7 @@ var (
 	hashCache         = make(map[string]string)
 	hashCacheMu       sync.RWMutex
 	hashCacheLimit    = 10000
-	
+
 	// ✅ FIX 1: Async enrichment semaphore (limits concurrent hash ops)
 	enrichSem = make(chan struct{}, 32)
 	// ✅ FIX 5: Hash computation semaphore (limits FD usage)
@@ -112,13 +113,13 @@ func PopulateInitialProcessTable() {
 		isOrphan := process.IsOrphanProcess(uint32(p.PID), livePIDs)
 
 		proc := &ProcessInfo{
-			PID:      uint32(p.PID),
-			Image:    p.Name,
+			PID:       uint32(p.PID),
+			Image:     p.Name,
 			ImagePath: p.Path,
 			StartTime: startTime,
-			IsAlive:  true,
-			IsOrphan: isOrphan,
-			Username: username,
+			IsAlive:   true,
+			IsOrphan:  isOrphan,
+			Username:  username,
 			Enrichment: ProcessEnrichment{
 				IsSystem: isSystemProcess(p.Path),
 				Username: username,
@@ -205,16 +206,16 @@ func (e *Engine) forwardNetworkEvents() {
 
 		if exists && proc.IsAlive {
 			conn := &ConnectionInfo{
-	RemoteIP:   netEvt.RemoteIP,
-	RemotePort: netEvt.RemotePort,
-	Protocol:   netEvt.Protocol,
-	BytesSent:  netEvt.BytesSent,
-	BytesRecv:  netEvt.BytesRecv,
-	FirstSeen:  netEvt.Timestamp,
-	LastSeen:   netEvt.Timestamp,
-	Domain:     netEvt.Domain,
-	State:      mapOpcodeToConnectionState(uint8(netEvt.Opcode), netEvt.Protocol), // ✅ NEW
-}
+				RemoteIP:   netEvt.RemoteIP,
+				RemotePort: netEvt.RemotePort,
+				BytesSent:  netEvt.BytesSent,
+				Protocol:   netEvt.Protocol,
+				BytesRecv:  netEvt.BytesRecv,
+				FirstSeen:  netEvt.Timestamp,
+				LastSeen:   netEvt.Timestamp,
+				Domain:     netEvt.Domain,
+				State:      mapOpcodeToConnectionState(uint8(netEvt.Opcode), netEvt.Protocol), // ✅ NEW
+			}
 			proc.UpsertConnection(conn)
 			connTableMu.Lock()
 			connectionTable[netEvt.PID] = append(connectionTable[netEvt.PID], conn)
@@ -263,7 +264,7 @@ func (e *Engine) HandleProcessStart(ev events.EventInput) {
 			IsSystem: false, // Will be corrected async
 		},
 	}
-	
+
 	// Link to parent if known
 	if ppid > 0 {
 		if parent, ok := processTable[ppid]; ok && parent.IsAlive {
@@ -276,7 +277,7 @@ func (e *Engine) HandleProcessStart(ev events.EventInput) {
 
 	// ✅ FIX 1: Async enrichment (non-blocking)
 	go e.enrichAsync(ev.PID, imageName)
-	
+
 	resolvePendingChildren(ev.PID)
 	emitProcessStart(proc, seq)
 }
@@ -285,7 +286,7 @@ func (e *Engine) HandleProcessStart(ev events.EventInput) {
 func (e *Engine) HandleProcessStop(ev events.EventInput) {
 	tableMu.Lock()
 	proc, exists := processTable[ev.PID]
-	
+
 	if !exists {
 		// Pre-existing process that we missed
 		imageName := resolveProcessImage(ev.PID)
@@ -304,21 +305,21 @@ func (e *Engine) HandleProcessStop(ev events.EventInput) {
 		emitProcessStop(proc)
 		return
 	}
-	
+
 	proc.EndTime = ev.Timestamp
 	proc.IsAlive = false
 	if proc.Image == "" || proc.Image == "unknown" {
 		proc.Image = resolveProcessImage(ev.PID)
 	}
 	tableMu.Unlock()
-	
+
 	// ✅ FIX 6: Stop-time fallback enrichment
 	if proc.Enrichment.ExecutablePath == "" {
 		go e.tryFallbackEnrichment(ev.PID, proc)
 	}
-	
+
 	emitProcessStop(proc)
-	
+
 	// Schedule cleanup after delay
 	go func(pid uint32) {
 		time.Sleep(2 * time.Second)
@@ -398,7 +399,8 @@ func enrichProcessAtStart(pid uint32, imageName string) ProcessEnrichment {
 		}
 	}
 	enrich.IsSigned = process.IsProcessSigned(pid)
-	enrich.UserSID = resolveProcessSID(pid)
+	enrich.Username = process.GetProcessUsername(pid) // ✅ Real username
+	enrich.UserSID = process.GetProcessUserSID(pid)   // ✅ Real SID
 	return enrich
 }
 
@@ -409,7 +411,7 @@ func enrichProcessAtStart(pid uint32, imageName string) ProcessEnrichment {
 func (e *Engine) tryFallbackEnrichment(pid uint32, proc *ProcessInfo) {
 	if path := process.GetExecutablePath(pid); path != "" && path != "unknown" {
 		hash := computeSHA256Safe(path)
-		
+
 		tableMu.Lock()
 		if p, ok := processTable[pid]; ok {
 			if p.Enrichment.ExecutablePath == "" {
@@ -478,6 +480,11 @@ func emitNetworkEvent(evt events.NetworkEvent, proc *ProcessInfo) {
 	imageName := "unknown"
 	if proc != nil && proc.Image != "" {
 		imageName = proc.Image
+	} else {
+		// 🔄 Fallback: Directly query Windows if our internal cache missed the process
+		if resolved := process.GetProcessNameByPID(evt.PID); resolved != "" {
+			imageName = resolved
+		}
 	}
 	output := map[string]interface{}{
 		"event_type":  "network_connection",
@@ -514,6 +521,25 @@ func emitNetworkEvent(evt events.NetworkEvent, proc *ProcessInfo) {
 	default:
 	}
 	fmt.Printf("%s\n", string(jsonBytes))
+
+	// 🔥 Send to network output file channel (non-blocking)
+	select {
+	case events.NetworkOutputChan <- events.NetworkOutputRecord{
+		Timestamp:  evt.Timestamp.Format(time.RFC3339Nano),
+		PID:        evt.PID,
+		Image:      imageName,
+		RemoteIP:   evt.RemoteIP,
+		RemotePort: evt.RemotePort,
+		Protocol:   evt.Protocol,
+		Domain:     evt.Domain,
+		BytesSent:  evt.BytesSent,
+		BytesRecv:  evt.BytesRecv,
+		State:      string(mapOpcodeToConnectionState(evt.Opcode, evt.Protocol)),
+	}:
+	default:
+	}
+	// 🔥 Force Windows to flush stdout so piped commands (findstr, SIEM, etc.) see it instantly
+	syscall.FlushFileBuffers(syscall.Handle(os.Stdout.Fd()))
 }
 
 func nonBlockingEmit(evt StructuredEvent) {
@@ -541,7 +567,7 @@ func resolvePendingChildren(parentPID uint32) {
 	}
 	delete(pendingEvents, parentPID)
 	pendingMu.Unlock()
-	
+
 	tableMu.RLock()
 	_, parentExists := processTable[parentPID]
 	tableMu.RUnlock()
@@ -591,31 +617,31 @@ func shouldAggregate(evt StructuredEvent) bool {
 	if isCriticalProcess(evt.Image) {
 		return false
 	}
-	
+
 	aggMu.Lock()
 	defer aggMu.Unlock()
-	
+
 	stats, exists := spawnAggregator[key]
 	now := time.Now()
-	
+
 	if !exists {
 		spawnAggregator[key] = &SpawnStats{
 			ParentImage: evt.ParentImage,
 			ChildImage:  evt.Image,
 			FirstSeen:   now,
-			LastSeen:    now,  // ← Critical for eviction
+			LastSeen:    now, // ← Critical for eviction
 			Count:       1,
 			WindowStart: now,
 		}
 		return false
 	}
-	
+
 	if now.Sub(stats.WindowStart) < aggregationWindow {
 		stats.Count++
 		stats.LastSeen = now
 		return true
 	}
-	
+
 	emitAggregationSummary(stats)
 	stats.Count = 1
 	stats.FirstSeen = now
@@ -760,7 +786,7 @@ func cleanupDNSCache() {
 // ✅ FIX 5: SAFE SHA256 WITH FD THROTTLING
 // ============================================================================
 func computeSHA256Safe(path string) string {
-	hashSem <- struct{}{} // Acquire semaphore
+	hashSem <- struct{}{}        // Acquire semaphore
 	defer func() { <-hashSem }() // Release semaphore
 
 	file, err := os.Open(path)
@@ -853,11 +879,11 @@ func isSystemProcess(imagePath string) bool {
 	}
 	// Normalize path separators for reliable matching
 	normalized := strings.ToLower(strings.ReplaceAll(imagePath, "/", "\\"))
-	
+
 	// Check for Windows system directories (case-insensitive)
 	return strings.Contains(normalized, `c:\windows\system32`) ||
-		   strings.Contains(normalized, `c:\windows\syswow64`) ||
-		   strings.Contains(normalized, `\systemroot\`)
+		strings.Contains(normalized, `c:\windows\syswow64`) ||
+		strings.Contains(normalized, `\systemroot\`)
 }
 
 func cleanupStaleProcesses() {
@@ -938,7 +964,7 @@ func mapOpcodeToConnectionState(opcode uint8, protocol string) ConnectionState {
 	if protocol != "TCP" {
 		return StateUnknown // UDP is connectionless
 	}
-	
+
 	// ETW opcode constants (from evntcons.h)
 	const (
 		EVENT_TRACE_TYPE_CONNECT    = 10
@@ -949,7 +975,7 @@ func mapOpcodeToConnectionState(opcode uint8, protocol string) ConnectionState {
 		EVENT_TRACE_TYPE_DISCONNECT = 15
 		EVENT_TRACE_TYPE_RETRANSMIT = 16
 	)
-	
+
 	switch opcode {
 	case EVENT_TRACE_TYPE_CONNECT, EVENT_TRACE_TYPE_ACCEPT, EVENT_TRACE_TYPE_RECONNECT:
 		return StateEstablished

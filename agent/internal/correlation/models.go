@@ -2,6 +2,7 @@
 package correlation
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -12,11 +13,11 @@ import (
 type ConnectionState string
 
 const (
-	StateNew       ConnectionState = "new"
-	StateEstablished               = "established"
-	StateClosing                   = "closing"
-	StateClosed                    = "closed"
-	StateUnknown                   = "unknown"
+	StateNew         ConnectionState = "new"
+	StateEstablished                 = "established"
+	StateClosing                     = "closing"
+	StateClosed                      = "closed"
+	StateUnknown                     = "unknown"
 )
 
 // ProcessInfo holds enriched process metadata
@@ -29,8 +30,8 @@ type ProcessInfo struct {
 	StartTime   time.Time
 	EndTime     time.Time
 	IsAlive     bool
-	IsOrphan    bool          // ← ADD THIS
-	Username    string        // ← ADD THIS
+	IsOrphan    bool   // ← ADD THIS
+	Username    string // ← ADD THIS
 	Parent      *ProcessInfo
 	Children    []*ProcessInfo
 	Enrichment  ProcessEnrichment
@@ -45,10 +46,10 @@ type ProcessEnrichment struct {
 	IsSigned       bool   `json:"is_signed"`
 	IsSystem       bool   `json:"is_system"`
 	UserSID        string `json:"user_sid,omitempty"`
-	Username       string `json:"username,omitempty"`       // ← ADD
-	SizeBytes      int64  `json:"size_bytes,omitempty"`     // ← ADD
-	SizeKB         int64  `json:"size_kb,omitempty"`        // ← ADD
-	IsOrphan       bool   `json:"is_orphan,omitempty"`      // ← ADD
+	Username       string `json:"username,omitempty"`   // ← ADD
+	SizeBytes      int64  `json:"size_bytes,omitempty"` // ← ADD
+	SizeKB         int64  `json:"size_kb,omitempty"`    // ← ADD
+	IsOrphan       bool   `json:"is_orphan,omitempty"`  // ← ADD
 }
 
 // StructuredEvent is the unified output format
@@ -110,10 +111,10 @@ type ConnectionInfo struct {
 func (p *ProcessInfo) UpsertConnection(conn *ConnectionInfo) {
 	p.connMu.Lock()
 	defer p.connMu.Unlock()
-	
-	key := conn.RemoteIP + ":" + string(conn.RemotePort) + ":" + conn.Protocol
+
+	key := fmt.Sprintf("%s:%d:%s", conn.RemoteIP, conn.RemotePort, conn.Protocol)
 	for _, existing := range p.Connections {
-		existingKey := existing.RemoteIP + ":" + string(existing.RemotePort) + ":" + existing.Protocol
+		existingKey := fmt.Sprintf("%s:%d:%s", existing.RemoteIP, existing.RemotePort, existing.Protocol)
 		if existingKey == key {
 			existing.BytesSent += conn.BytesSent
 			existing.BytesRecv += conn.BytesRecv

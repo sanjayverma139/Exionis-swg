@@ -1,0 +1,30 @@
+panic: runtime error: invalid memory address or nil pointer dereference [recovered, repanicked]
+[signal 0xc0000005 code=0x0 addr=0x0 pc=0x7ff735300534]
+
+goroutine 426 [running]:
+encoding/json.(*encodeState).marshal.func1()
+	C:/Program Files/Go/src/encoding/json/encode.go:339 +0x68
+panic({0x7ff7353b6ae0?, 0x7ff735382550?})
+	C:/Program Files/Go/src/runtime/panic.go:860 +0x13a
+encoding/json.appendString[...]({0x1e6b09fee232?, 0x1e6b098cb6c0?, 0x7ff73529e609?}, {0x0?, 0x32}, 0x1)
+	C:/Program Files/Go/src/encoding/json/encode.go:1003 +0xd4
+encoding/json.stringEncoder(0x1e6b0a090300, {0x7ff7353ac360?, 0x1e6b0a546bf0?, 0x7ff7353b3da0?}, {0x94?, 0x0?})
+	C:/Program Files/Go/src/encoding/json/encode.go:632 +0x413
+encoding/json.(*encodeState).reflectValue(0x1e6b0a090300, {0x7ff7353ac360?, 0x1e6b0a546bf0?, 0x1e6b0a546d30?}, {0x94?, 0x0?})
+	C:/Program Files/Go/src/encoding/json/encode.go:367 +0x73
+encoding/json.interfaceEncoder(0x1e6b0a090300, {0x7ff7353b3da0?, 0x1e6b0a546c90?, 0xa?}, {0x98?, 0x9f?})
+	C:/Program Files/Go/src/encoding/json/encode.go:700 +0xba
+encoding/json.mapEncoder.encode({0x7ff73528c505?}, 0x1e6b0a090300, {0x7ff7353ba6a0?, 0x1e6b0939f800?, 0x7ff7353ba6a0?}, {0x8?, 0x0?})
+	C:/Program Files/Go/src/encoding/json/encode.go:804 +0x4d0
+encoding/json.(*encodeState).reflectValue(0x1e6b0a090300, {0x7ff7353ba6a0?, 0x1e6b0939f800?, 0x7ff7353ba6a0?}, {0x40?, 0x23?})
+	C:/Program Files/Go/src/encoding/json/encode.go:367 +0x73
+encoding/json.(*encodeState).marshal(0x7ff7353ba6a0?, {0x7ff7353ba6a0?, 0x1e6b0939f800?}, {0x9?, 0x0?})
+	C:/Program Files/Go/src/encoding/json/encode.go:343 +0xb1
+encoding/json.Marshal({0x7ff7353ba6a0, 0x1e6b0939f800})
+	C:/Program Files/Go/src/encoding/json/encode.go:209 +0xbe
+exionis/internal/correlation.emitNetworkEvent({0x1b30, {0x1e6b0a319840, 0xd}, {0x1e6b0a319850, 0xc}, 0xf100, 0x1bb, {0x1e6b0a31983c, 0x3}, {0x7ff7353ea461, ...}, ...}, ...)
+	D:/Project/Exionis-swg/agent/internal/correlation/engine.go:508 +0x4f7
+exionis/internal/correlation.(*Engine).forwardNetworkEvents(0x0?)
+	D:/Project/Exionis-swg/agent/internal/correlation/engine.go:224 +0xb1
+created by exionis/internal/correlation.(*Engine).Run in goroutine 419
+	D:/Project/Exionis-swg/agent/internal/correlation/engine.go:148 +0xc9
