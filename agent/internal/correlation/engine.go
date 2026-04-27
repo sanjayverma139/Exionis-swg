@@ -18,14 +18,6 @@ import (
 	"exionis/internal/process"
 )
 
-// PIDHistoryEntry uniquely identifies a process instance by PID + StartTime.
-// Prevents PID reuse confusion (e.g., chrome.exe exits, malware.exe reuses same PID).
-type PIDHistoryEntry struct {
-	Name      string
-	StartTime time.Time
-	UpdatedAt time.Time
-}
-
 // ============================================================================
 // GLOBAL STATE & CONCURRENCY CONTROLS
 // ============================================================================
@@ -39,11 +31,9 @@ var (
 	sequenceCounter uint64
 	seqMu           sync.Mutex
 	StructuredOutput = make(chan StructuredEvent, 10000)
-	aggregationWindow = 2 * time.Second
-
-	// processTTL controls how long DEAD (IsAlive=false) process records are
-	// retained in the table before being evicted by the maintenance ticker.
-	// Only dead records are evicted — alive processes are never pruned by TTL.
+	
+	// ✅ FIX A: Increased from 2s to 30s to avoid suppressing legitimate startup bursts
+	aggregationWindow = 30 * time.Second
 	processTTL = 10 * time.Minute
 
 	connectionTable = make(map[uint32][]*ConnectionInfo)
@@ -55,23 +45,29 @@ var (
 	hashCacheMu     sync.RWMutex
 	hashCacheLimit  = 10000
 
-	// enrichSem limits concurrent background enrichment goroutines (hash + path).
 	enrichSem = make(chan struct{}, 32)
-	// hashSem limits concurrent file-open operations for SHA256 computation.
-	hashSem = make(chan struct{}, 10)
+	hashSem   = make(chan struct{}, 10)
 
-	// legacyOutput is the package-level channel used by emitLegacyOutput.
 	legacyOutput   chan CorrelatedEvent
 	legacyOutputMu sync.RWMutex
 
-	// PID history cache for resolving process names after exit (PID reuse protection).
 	pidHistory   = make(map[uint32]PIDHistoryEntry)
 	pidHistoryMu sync.RWMutex
+
+	// DEBUG MODE: Enable verbose stdout flushing (disable in production)
+	debugMode = os.Getenv("EXIONIS_DEBUG") == "1"
 )
 
 type dnsCacheEntry struct {
 	domain  string
 	expires time.Time
+}
+
+// PIDHistoryEntry uniquely identifies a process instance by PID + StartTime.
+type PIDHistoryEntry struct {
+	Name      string
+	StartTime time.Time
+	UpdatedAt time.Time
 }
 
 // Engine is the main correlation processor.
@@ -80,7 +76,7 @@ type Engine struct {
 	mu     sync.RWMutex
 }
 
-// New creates a new Engine instance and registers its Output channel globally.
+// New creates a new Engine instance.
 func New() *Engine {
 	e := &Engine{Output: make(chan CorrelatedEvent, 5000)}
 	legacyOutputMu.Lock()
@@ -90,14 +86,12 @@ func New() *Engine {
 	return e
 }
 
-// RegistrySize returns current process table size (thread-safe).
 func (e *Engine) RegistrySize() int {
 	tableMu.RLock()
 	defer tableMu.RUnlock()
 	return len(processTable)
 }
 
-// GetActiveConnectionCount returns active connection count (thread-safe).
 func GetActiveConnectionCount() int {
 	connTableMu.RLock()
 	defer connTableMu.RUnlock()
@@ -109,7 +103,7 @@ func GetActiveConnectionCount() int {
 }
 
 // ============================================================================
-// PID HISTORY CACHE HELPERS (PID Reuse Protection)
+// PID HISTORY CACHE (PID Reuse Protection)
 // ============================================================================
 
 func rememberPIDName(pid uint32, name string, start time.Time) {
@@ -128,14 +122,22 @@ func rememberPIDName(pid uint32, name string, start time.Time) {
 func getRememberedPIDName(pid uint32) string {
 	pidHistoryMu.RLock()
 	defer pidHistoryMu.RUnlock()
+	
 	entry, ok := pidHistory[pid]
 	if !ok {
 		return ""
 	}
-	// Reject stale cache entries (PID may have been reused by Windows)
+	
+	// ✅ ADD THESE TWO LINES for PID reuse protection:
+	// Only use cache if entry is recent
 	if time.Since(entry.UpdatedAt) > 30*time.Minute {
 		return ""
 	}
+	// Reject if StartTime is too far in past (prevents false matches on PID reuse)
+	if time.Since(entry.StartTime) > 1*time.Hour {
+		return ""
+	}
+	
 	return entry.Name
 }
 
@@ -151,11 +153,133 @@ func cleanupPIDHistory() {
 }
 
 // ============================================================================
-// BOOTSTRAP: populate table with already-running processes before ETW fires
+// RISK SCORING ENGINE (Non-blocking, informational only)
 // ============================================================================
 
-// PopulateInitialProcessTable bootstraps the process table before ETW starts.
-// Called once from main.go before StartETWListener().
+func computeRiskScore(evt StructuredEvent, cmdline string) (int, []string) {
+	score := 0
+	reasons := []string{}
+
+	image := strings.ToLower(evt.Image)
+
+	lolbins := map[string]int{
+		"powershell.exe": 15, "pwsh.exe": 15,
+		"certutil.exe": 20, "bitsadmin.exe": 20,
+		"mshta.exe": 25, "rundll32.exe": 15,
+		"regsvr32.exe": 20, "wmic.exe": 15,
+		"scrcons.exe": 30, "installutil.exe": 20,
+	}
+	if pts, ok := lolbins[image]; ok {
+		score += pts
+		reasons = append(reasons, "lolbin_usage")
+	}
+
+	cmdLower := strings.ToLower(cmdline)
+	if strings.Contains(cmdLower, "-enc") || strings.Contains(cmdLower, "-encodedcommand") {
+		score += 40
+		reasons = append(reasons, "encoded_command")
+	}
+	if strings.Contains(cmdLower, "frombase64") || strings.Contains(cmdLower, "iex(") || strings.Contains(cmdLower, "invoke-expression") {
+		score += 35
+		reasons = append(reasons, "dynamic_execution")
+	}
+	if strings.Contains(cmdLower, "-windowstyle hidden") || strings.Contains(cmdLower, "-nop -w hidden") {
+		score += 25
+		reasons = append(reasons, "hidden_window")
+	}
+
+	if evt.ParentImage != "" {
+		parent := strings.ToLower(evt.ParentImage)
+		if (parent == "winword.exe" || parent == "excel.exe" || parent == "powerpnt.exe") && image == "cmd.exe" {
+			score += 35
+			reasons = append(reasons, "office_spawn_cmd")
+		}
+		if parent == "cmd.exe" && (image == "powershell.exe" || image == "pwsh.exe") {
+			score += 20
+			reasons = append(reasons, "cmd_spawn_powershell")
+		}
+		if parent == "explorer.exe" && (image == "cmd.exe" || image == "powershell.exe") && evt.Depth >= 2 {
+			score += 15
+			reasons = append(reasons, "deep_shell_spawn")
+		}
+	}
+
+	if evt.ImagePath != "" {
+		pathLower := strings.ToLower(evt.ImagePath)
+		if strings.Contains(pathLower, `\temp\`) || strings.Contains(pathLower, `\appdata\local\temp\`) {
+			score += 25
+			reasons = append(reasons, "temp_folder_execution")
+		}
+		if strings.Contains(pathLower, `\users\public\`) {
+			score += 20
+			reasons = append(reasons, "public_folder_execution")
+		}
+	}
+
+	if !evt.Enrichment.IsSigned && evt.ImagePath != "" && !isSystemProcess(evt.ImagePath) {
+		score += 20
+		reasons = append(reasons, "unsigned_non_system")
+	}
+
+	if score > 100 {
+		score = 100
+	}
+
+	return score, reasons
+}
+
+// ============================================================================
+// GENEALOGY BUILDER
+// ============================================================================
+
+func buildGenealogyChain(pid uint32, imageName string, ppid uint32) (parentImg, grandParentImg, chain string, depth int, rootPID uint32) {
+	tableMu.RLock()
+	defer tableMu.RUnlock()
+
+	parentImg = ""
+	grandParentImg = ""
+	chain = imageName
+	depth = 1
+	rootPID = pid
+
+	if ppid > 0 {
+		if parent, ok := processTable[ppid]; ok {
+			parentImg = parent.Image
+			chain = parent.Image + " > " + imageName
+			depth = 2
+			rootPID = parent.RootPID
+			if rootPID == 0 {
+				rootPID = parent.PID
+			}
+
+			if parent.PPID > 0 {
+				if grandparent, ok := processTable[parent.PPID]; ok {
+					grandParentImg = grandparent.Image
+					chain = grandparent.Image + " > " + chain
+					depth = 3
+					if grandparent.RootPID != 0 {
+						rootPID = grandparent.RootPID
+					}
+				}
+			}
+		}
+	}
+
+	if parentImg == "" && ppid > 0 {
+		if name := process.GetProcessNameByPID(ppid); name != "" {
+			parentImg = name
+			chain = name + " > " + imageName
+			depth = 2
+		}
+	}
+
+	return parentImg, grandParentImg, chain, depth, rootPID
+}
+
+// ============================================================================
+// BOOTSTRAP
+// ============================================================================
+
 func PopulateInitialProcessTable() {
 	procs := process.GetProcesses()
 	livePIDs := process.BuildLivePIDSet()
@@ -182,6 +306,9 @@ func PopulateInitialProcessTable() {
 			IsAlive:   true,
 			IsOrphan:  isOrphan,
 			Username:  username,
+			Depth:     1,
+			RootPID:   uint32(p.PID),
+			Chain:     p.Name,
 			Enrichment: ProcessEnrichment{
 				IsSystem: isSystemProcess(p.Path),
 				Username: username,
@@ -192,12 +319,15 @@ func PopulateInitialProcessTable() {
 			proc.PPID = parentPID
 			if parent, ok := processTable[parentPID]; ok {
 				proc.Parent = parent
+				proc.ParentImage = parent.Image
 				parent.Children = append(parent.Children, proc)
+				proc.Depth = parent.Depth + 1
+				proc.RootPID = parent.RootPID
+				proc.Chain = parent.Chain + " > " + p.Name
 			}
 		}
 		go enrichProcessAsync(proc, p.Name)
 		processTable[uint32(p.PID)] = proc
-		// BUG 3 + PID REUSE FIX: Cache name at bootstrap
 		rememberPIDName(uint32(p.PID), p.Name, startTime)
 	}
 }
@@ -206,7 +336,6 @@ func PopulateInitialProcessTable() {
 // ENGINE MAIN LOOP
 // ============================================================================
 
-// Run starts the main event processing loop. Blocks until src is closed.
 func (e *Engine) Run(src <-chan events.EventInput) {
 	go runPendingResolver()
 	go runMaintenanceTicker()
@@ -270,7 +399,6 @@ func (e *Engine) forwardNetworkEvents() {
 			connTableMu.Unlock()
 		}
 
-		// BUG 2 FIX: Ensure direction and local_ip are never empty
 		if netEvt.Direction == "" && netEvt.Protocol == "TCP" {
 			netEvt.Direction = mapOpcodeToDirection(netEvt.Opcode, netEvt.Protocol)
 		}
@@ -289,7 +417,7 @@ func (e *Engine) forwardNetworkEvents() {
 }
 
 // ============================================================================
-// PROCESS START HANDLER
+// PROCESS START HANDLER — ✅ FIX C: Emit even for pre-existing processes
 // ============================================================================
 
 func (e *Engine) HandleProcessStart(ev events.EventInput) {
@@ -303,9 +431,13 @@ func (e *Engine) HandleProcessStart(ev events.EventInput) {
 		imageName = resolveProcessImage(ev.PID)
 	}
 	cmdline := process.GetCmdline(ev.PID)
-	initialEnrichment := enrichProcessAtStart(ev.PID, imageName)
+	if debugMode {
+		fmt.Fprintf(os.Stderr, "[CORR] HANDLE_START pid=%d ppid=%d image=%q detail=%q\n", ev.PID, ppid, imageName, ev.Detail)
+	}
 
 	tableMu.Lock()
+	
+	// ✅ FIX C: If process already exists and is alive, emit the event BEFORE returning
 	if existing, ok := processTable[ev.PID]; ok && existing.IsAlive {
 		if existing.Image == "" && imageName != "" {
 			existing.Image = imageName
@@ -313,32 +445,41 @@ func (e *Engine) HandleProcessStart(ev events.EventInput) {
 		if existing.Cmdline == "" {
 			existing.Cmdline = cmdline
 		}
-		if existing.Enrichment.ExecutablePath == "" && initialEnrichment.ExecutablePath != "" {
-			existing.Enrichment = initialEnrichment
-			existing.ImagePath = initialEnrichment.ExecutablePath
-		}
+		// Take snapshot and emit — this was missing, causing silent drops
+		snap := *existing
 		tableMu.Unlock()
+		emitProcessStart(&snap, seq)
 		return
 	}
+	tableMu.Unlock()
+
+	// buildGenealogyChain takes a read lock internally; calling it while holding
+	// the write lock deadlocks the process-start path on the first event.
+	parentImg, grandParentImg, chain, depth, rootPID := buildGenealogyChain(ev.PID, imageName, ppid)
 
 	proc := &ProcessInfo{
-		PID:        ev.PID,
-		PPID:       ppid,
-		Image:      imageName,
-		Cmdline:    cmdline,
-		ImagePath:  initialEnrichment.ExecutablePath,
-		StartTime:  ev.Timestamp,
-		IsAlive:    true,
-		Enrichment: initialEnrichment,
+		PID:              ev.PID,
+		PPID:             ppid,
+		Image:            imageName,
+		Cmdline:          cmdline,
+		StartTime:        ev.Timestamp,
+		IsAlive:          true,
+		ParentImage:      parentImg,
+		GrandParentImage: grandParentImg,
+		Chain:            chain,
+		Depth:            depth,
+		RootPID:          rootPID,
 	}
+
+	tableMu.Lock()
 	if ppid > 0 {
 		if parent, ok := processTable[ppid]; ok && parent.IsAlive {
 			proc.Parent = parent
 			parent.Children = append(parent.Children, proc)
 		}
 	}
+
 	processTable[ev.PID] = proc
-	// BUG 3 + PID REUSE FIX: Cache name at start event
 	rememberPIDName(ev.PID, imageName, ev.Timestamp)
 	tableMu.Unlock()
 
@@ -354,53 +495,67 @@ func (e *Engine) HandleProcessStart(ev events.EventInput) {
 func (e *Engine) HandleProcessStop(ev events.EventInput) {
 	tableMu.Lock()
 	proc, exists := processTable[ev.PID]
-
-	if !exists {
-		// BUG 3 + PID REUSE FIX: Multi-stage name resolution with cache age check
-		resolvedName := process.GetProcessNameByPID(ev.PID)
-
-		if resolvedName == "" {
-			resolvedName = process.GetProcessNameFromSnapshot(ev.PID)
-		}
-
-		if resolvedName == "" {
-			resolvedName = getRememberedPIDName(ev.PID)
-		}
-
-		if resolvedName == "" {
-			resolvedName = "<pre-existing>"
-		}
-
-		proc = &ProcessInfo{
-			PID:       ev.PID,
-			Image:     resolvedName,
-			StartTime: ev.Timestamp.Add(-1 * time.Second),
-			EndTime:   ev.Timestamp,
-			IsAlive:   false,
-		}
-		processTable[ev.PID] = proc
+	if exists {
+		proc.EndTime = ev.Timestamp
+		proc.IsAlive = false
 		tableMu.Unlock()
 		emitProcessStop(proc)
 		return
 	}
-
-	proc.EndTime = ev.Timestamp
-	proc.IsAlive = false
-	if proc.Image == "" || proc.Image == "unknown" {
-		proc.Image = resolveProcessImage(ev.PID)
-	}
 	tableMu.Unlock()
 
-	if proc.Enrichment.ExecutablePath == "" {
-		go e.tryFallbackEnrichment(ev.PID, proc)
+	ppid, detailImage := parseProcessDetail(ev.Detail)
+	resolvedName := detailImage
+	if resolvedName == "" || resolvedName == "<unknown>" || resolvedName == "unknown" {
+		// Fallback chain for late STOP events
+		resolvedName = process.GetProcessNameByPID(ev.PID)
+	}
+	if resolvedName == "" || resolvedName == "<unknown>" || resolvedName == "unknown" {
+		resolvedName = process.GetProcessNameFromSnapshot(ev.PID)
+	}
+	if resolvedName == "" || resolvedName == "<unknown>" || resolvedName == "unknown" {
+		resolvedName = getRememberedPIDName(ev.PID)
+	}
+	if resolvedName == "" || resolvedName == "<unknown>" || resolvedName == "unknown" {
+		if cmd := process.GetCmdline(ev.PID); cmd != "" {
+			parts := strings.Fields(cmd)
+			if len(parts) > 0 {
+				binary := parts[0]
+				if idx := strings.LastIndexAny(binary, `\/`); idx != -1 {
+					resolvedName = binary[idx+1:]
+				} else {
+					resolvedName = binary
+				}
+			}
+		}
+	}
+	if resolvedName == "" || resolvedName == "<unknown>" || resolvedName == "unknown" {
+		resolvedName = "unknown_process"
 	}
 
-	emitProcessStop(proc)
+	parentImg, grandParentImg, chain, depth, rootPID := buildGenealogyChain(ev.PID, resolvedName, ppid)
+	if rootPID == 0 {
+		rootPID = ev.PID
+	}
 
-	go func(pid uint32) {
-		time.Sleep(2 * time.Second)
-		deleteProcessSafe(pid)
-	}(ev.PID)
+	proc = &ProcessInfo{
+		PID:              ev.PID,
+		PPID:             ppid,
+		Image:            resolvedName,
+		StartTime:        ev.Timestamp.Add(-1 * time.Second),
+		EndTime:          ev.Timestamp,
+		IsAlive:          false,
+		ParentImage:      parentImg,
+		GrandParentImage: grandParentImg,
+		Depth:            depth,
+		RootPID:          rootPID,
+		Chain:            chain,
+	}
+
+	tableMu.Lock()
+	processTable[ev.PID] = proc
+	tableMu.Unlock()
+	emitProcessStop(proc)
 }
 
 // ============================================================================
@@ -559,33 +714,42 @@ func (e *Engine) tryFallbackEnrichment(pid uint32, proc *ProcessInfo) {
 // ============================================================================
 
 func emitProcessStart(proc *ProcessInfo, seq uint64) {
-	parentImage := ""
-	if proc.Parent != nil && proc.Parent.Image != "" {
-		parentImage = proc.Parent.Image
-	} else if proc.PPID > 0 {
+	parentImage := proc.ParentImage
+	if parentImage == "" && proc.PPID > 0 {
 		tableMu.RLock()
 		if parent, ok := processTable[proc.PPID]; ok {
 			parentImage = parent.Image
 		}
 		tableMu.RUnlock()
 	}
+
 	evt := StructuredEvent{
-		EventType:   "process_start",
-		Timestamp:   proc.StartTime,
-		PID:         proc.PID,
-		PPID:        proc.PPID,
-		Image:       proc.Image,
-		ParentImage: parentImage,
-		Cmdline:     proc.Cmdline,
-		ImagePath:   proc.Enrichment.ExecutablePath,
-		IsAlive:     true,
-		Resolved:    true,
-		Enrichment:  proc.Enrichment,
-		SequenceID:  seq,
+		EventType:        "process_start",
+		Timestamp:        proc.StartTime,
+		PID:              proc.PID,
+		PPID:             proc.PPID,
+		Image:            proc.Image,
+		ParentImage:      parentImage,
+		GrandParentImage: proc.GrandParentImage,
+		Chain:            proc.Chain,
+		Depth:            proc.Depth,
+		Cmdline:          proc.Cmdline,
+		ImagePath:        proc.Enrichment.ExecutablePath,
+		IsAlive:          true,
+		Resolved:         true,
+		Enrichment:       proc.Enrichment,
+		SequenceID:       seq,
 	}
+
+	score, reasons := computeRiskScore(evt, proc.Cmdline)
+	evt.RiskScore = score
+	evt.RiskReasons = reasons
+
+	// ✅ FIX B: Only suppress genuine bursts (10+ in window), not 2nd event
 	if shouldAggregate(evt) {
 		return
 	}
+
 	nonBlockingEmit(evt)
 }
 
@@ -595,23 +759,26 @@ func emitProcessStop(proc *ProcessInfo) {
 		duration = proc.EndTime.Sub(proc.StartTime).Milliseconds()
 	}
 	evt := StructuredEvent{
-		EventType:  "process_stop",
-		Timestamp:  proc.EndTime,
-		PID:        proc.PID,
-		Image:      proc.Image,
-		DurationMs: duration,
-		IsAlive:    false,
-		Resolved:   true,
-		Enrichment: proc.Enrichment,
+		EventType:        "process_stop",
+		Timestamp:        proc.EndTime,
+		PID:              proc.PID,
+		Image:            proc.Image,
+		ParentImage:      proc.ParentImage,
+		Chain:            proc.Chain,
+		Depth:            proc.Depth,
+		DurationMs:       duration,
+		IsAlive:          false,
+		Resolved:         true,
+		Enrichment:       proc.Enrichment,
+		RiskScore:        proc.RiskScore,
+		RiskReasons:      proc.RiskReasons,
 	}
 	nonBlockingEmit(evt)
 }
 
 func emitProcessEnrichmentUpdate(proc *ProcessInfo) {
-	parentImage := ""
-	if proc.Parent != nil && proc.Parent.Image != "" {
-		parentImage = proc.Parent.Image
-	} else if proc.PPID > 0 {
+	parentImage := proc.ParentImage
+	if parentImage == "" && proc.PPID > 0 {
 		tableMu.RLock()
 		if parent, ok := processTable[proc.PPID]; ok {
 			parentImage = parent.Image
@@ -619,21 +786,24 @@ func emitProcessEnrichmentUpdate(proc *ProcessInfo) {
 		tableMu.RUnlock()
 	}
 	nonBlockingEmit(StructuredEvent{
-		EventType:   "process_enrichment_update",
-		Timestamp:   time.Now(),
-		PID:         proc.PID,
-		PPID:        proc.PPID,
-		Image:       proc.Image,
-		ParentImage: parentImage,
-		Cmdline:     proc.Cmdline,
-		ImagePath:   proc.ImagePath,
-		IsAlive:     proc.IsAlive,
-		Resolved:    true,
-		Enrichment:  proc.Enrichment,
+		EventType:        "process_enrichment_update",
+		Timestamp:        time.Now(),
+		PID:              proc.PID,
+		PPID:             proc.PPID,
+		Image:            proc.Image,
+		ParentImage:      parentImage,
+		Cmdline:          proc.Cmdline,
+		ImagePath:        proc.ImagePath,
+		IsAlive:          proc.IsAlive,
+		Resolved:         true,
+		Enrichment:       proc.Enrichment,
+		Chain:            proc.Chain,
+		Depth:            proc.Depth,
+		RiskScore:        proc.RiskScore,
+		RiskReasons:      proc.RiskReasons,
 	})
 }
 
-// BUG 1 FIX: emitNetworkEvent ONLY prints to stdout and sends to events.NetworkOutputChan
 func emitNetworkEvent(evt events.NetworkEvent, proc *ProcessInfo) {
 	imageName := "unknown"
 	if proc != nil && proc.Image != "" {
@@ -688,7 +858,9 @@ func emitNetworkEvent(evt events.NetworkEvent, proc *ProcessInfo) {
 	}:
 	default:
 	}
-	syscall.FlushFileBuffers(syscall.Handle(os.Stdout.Fd()))
+	if debugMode {
+		syscall.FlushFileBuffers(syscall.Handle(os.Stdout.Fd()))
+	}
 }
 
 func nonBlockingEmit(evt StructuredEvent) {
@@ -776,7 +948,7 @@ func runPendingResolver() {
 }
 
 // ============================================================================
-// AGGREGATION
+// AGGREGATION — ✅ FIX B: Threshold-based suppression
 // ============================================================================
 
 func shouldAggregate(evt StructuredEvent) bool {
@@ -809,7 +981,8 @@ func shouldAggregate(evt StructuredEvent) bool {
 	if now.Sub(stats.WindowStart) < aggregationWindow {
 		stats.Count++
 		stats.LastSeen = now
-		return true
+		// ✅ FIX B: Only suppress if genuine burst (10+ same pair in window)
+		return stats.Count > 10
 	}
 
 	emitAggregationSummary(stats)
@@ -854,6 +1027,9 @@ func isCriticalProcess(image string) bool {
 		"services.exe": true, "svchost.exe": true, "explorer.exe": true,
 		"cmd.exe": true, "powershell.exe": true, "wscript.exe": true,
 		"mshta.exe": true, "regsvr32.exe": true, "rundll32.exe": true,
+		"conhost.exe": true, "taskhostw.exe": true, "runtimebroker.exe": true,
+		"wmiprvse.exe": true, "dllhost.exe": true, "sihost.exe": true,
+		"ctfmon.exe": true, "searchindexer.exe": true, "backgroundtaskhost.exe": true,
 	}
 	return critical[strings.ToLower(image)]
 }
@@ -1013,13 +1189,22 @@ func computeFileSHA256(path string) (string, error) {
 func cleanupStaleProcesses() {
 	tableMu.Lock()
 	defer tableMu.Unlock()
+
 	now := time.Now()
+	cleaned := 0
+
 	for pid, proc := range processTable {
-		if !proc.IsAlive && now.Sub(proc.EndTime) > processTTL {
+		if !proc.IsAlive && 
+		   !proc.EndTime.IsZero() && 
+		   now.Sub(proc.EndTime) > processTTL {
 			delete(processTable, pid)
+			cleaned++
 		}
 	}
-	// PID REUSE FIX: Clean up stale PID history entries
+
+	if debugMode && cleaned > 0 {
+		fmt.Fprintf(os.Stderr, "[cleanup] removed %d stale processes\n", cleaned)
+	}
 	cleanupPIDHistory()
 }
 
@@ -1078,7 +1263,6 @@ func cleanupSpawnAggregator() {
 	}
 }
 
-// Thread-safe process table accessors.
 func getProcessSafe(pid uint32) (*ProcessInfo, bool) {
 	tableMu.RLock()
 	defer tableMu.RUnlock()
@@ -1141,7 +1325,6 @@ func mapOpcodeToConnectionState(opcode uint8, protocol string) ConnectionState {
 	}
 }
 
-// BUG 2 FIX: Helper to map opcode to direction for TCP events (uint8 signature)
 func mapOpcodeToDirection(opcode uint8, protocol string) string {
 	if protocol != "TCP" {
 		return "unknown"

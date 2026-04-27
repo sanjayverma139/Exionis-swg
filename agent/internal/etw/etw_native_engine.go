@@ -8,11 +8,13 @@ package etw
 import "C"
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"exionis/internal/config"
 	"exionis/internal/events"
 )
+
 
 //export exionis_go_emit_event
 func exionis_go_emit_event(
@@ -25,11 +27,16 @@ func exionis_go_emit_event(
 	provider *C.char,
 	detail *C.char,
 ) {
+	eventTypeStr := C.GoString(eventType)
+	if eventTypeStr != "PROCESS_START" && eventTypeStr != "PROCESS_STOP" {
+		return
+	}
+
 	unixNano := int64(uint64(timestamp)-116444736000000000) * 100
 	ts := time.Unix(0, unixNano)
 
 	evt := events.EventInput{
-		Type:      C.GoString(eventType),
+		Type:      eventTypeStr,
 		Provider:  C.GoString(provider),
 		PID:       uint32(pid),
 		TID:       uint32(tid),
@@ -39,9 +46,11 @@ func exionis_go_emit_event(
 		Timestamp: ts,
 	}
 
+	// Send event — block briefly to avoid dropping startup events
 	select {
 	case events.ProcessChan <- evt:
-	default:
+	case <-time.After(250 * time.Millisecond):
+		fmt.Fprintf(os.Stderr, "[ETW-GO] DROPPED: type=%s pid=%d\n", evt.Type, evt.PID)
 	}
 }
 

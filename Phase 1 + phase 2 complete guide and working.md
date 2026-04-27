@@ -1,109 +1,185 @@
-```mermaid
-flowchart TD
-    %% ===== PHASE 1: INITIALIZATION & ASSET INTELLIGENCE =====
-    subgraph Phase1["🟦 Phase 1: Device Shadowing & Asset Intelligence"]
-        A1["🚀 Start Agent"] --> A2["🔐 Enable Privileges\nSeSystemProfile\nSeDebug"]
-        A2 --> A3["🆔 Generate Device ID\nMachine GUID + Disk Serial\nSHA256 → dev:xxxx"]
-        A3 --> A4["📁 Initialize File Sink\nNDJSON rotation\n100MB/10 files"]
-        A4 --> A5["🌐 Load Network Config\nInternal IP ranges\nRFC1918 + custom"]
-        A5 --> A6["📦 Collect Installed Apps\nHKLM + HKCU + WoW64\nDeduplication"]
-        A6 --> A6a["✅ Validate Paths\nos.Stat checks"]
-        A6 --> A6b["📊 Calculate Sizes\nAsync directory walk"]
-        A6 --> A6c["🔍 Detect Install Source\nMSI/EXE/InnoSetup"]
-        A6 --> A7["🛡️ Apply Security Filters\nNoise removal\nRisk scoring\nCode signing check"]
-        A7 --> A8["🔄 Bootstrap Process Table\nSnapshot running processes"]
-        A8 --> P1_DONE["✅ Phase 1 Complete\nEmit device_inventory JSON"]
-    end
+# Exionis SWG - Phase 1 and Phase 2 Working Guide
 
-    %% ===== PHASE 2: REAL-TIME ETW TELEMETRY =====
-    subgraph Phase2["🟧 Phase 2: Real-time Process & Network Monitoring"]
-        B1["🪟 Start ETW Kernel Session\nStartTraceW"] --> B2["📡 Attach Consumer\nOpenTraceW"]
-        B2 --> B3["🔄 ProcessTraceW\nEvent Loop Running"]
-        B3 --> B4{"❓ Event Type?"}
-        
-        B4 -->|PROCESS_START/STOP| B5["🔍 Parse PID/PPID/Image\nFrom ETW detail field"]
-        B4 -->|TCP/UDP Network| B6["🌐 Parse IPs/Ports/Bytes\n20-byte IPv4 layout"]
-        
-        B5 --> B7["🔗 CGO Callback\nto Go Layer"]
-        B6 --> B8["🚫 Filter: localhost +\nInternal IPs + Config"]
-        B8 -->|External ✅| B7
-        
-        B7 --> C1["🐹 Go Bridge\netw_native_engine.go"]
-        C1 --> C2["🔄 Convert C Event\n→ Go Struct"]
-        C2 --> C3["📤 Publish to Channels\nProcessChan / NetworkChan"]
-    end
+## Executive Summary
 
-    %% ===== CORRELATION ENGINE =====
-    subgraph Correlation["🧠 Correlation Engine"]
-        C3 --> D1{"🔀 Channel Router"}
-        D1 -->|ProcessChan| D2["⚙️ HandleProcessStart\nHandleProcessStop"]
-        D1 -->|NetworkChan| D3["🌐 forwardNetworkEvents"]
-        
-        D2 --> D4["🔎 Lookup PID in\nProcess Table"]
-        D4 --> D5["🔗 Link Parent-Child\nRelationship"]
-        D5 --> D6["✨ Async Enrichment\nPath/Hash/SID/Username"]
-        D6 --> D7["💾 Register in\nProcess Table"]
-        D7 --> D8["⏱️ Calculate duration_ms\non ProcessStop"]
-        
-        D3 --> D9["🌍 ResolveDomain\nAsync DNS + Cache"]
-        D9 --> D10["🗺️ Map Opcode\n→ ConnectionState"]
-        D10 --> D11["📦 Create ConnectionInfo\nwith state field"]
-        D11 --> D12["🔄 UpsertConnection\nAggregate by IP:Port:Proto"]
-    end
+Exionis now has a working two-phase pipeline:
 
-    %% ===== OUTPUT PIPELINE =====
-    subgraph Output["📤 Output Pipeline"]
-        D8 --> E1["📄 Emit process_stop JSON"]
-        D12 --> E2["🌐 Emit network_connection JSON"]
-        D7 --> E3["📄 Emit process_start JSON"]
-        
-        E1 --> E4["🔄 StructuredOutput Channel"]
-        E2 --> E4
-        E3 --> E4
-        
-        E4 --> E5{"🔀 Dual Output"}
-        E5 -->|Local File| E6["📁 NDJSON Log Files\nC:\ProgramData\Exionis\logs\nRotating 100MB"]
-        E5 -->|stdout| E7["☁️ Cloud Pipeline\nNDJSON Stream → findstr/SIEM"]
-        
-        E2 --> E2a["📁 NetworkOutputChan\n→ network_*.ndjson"]
-        E1 & E3 --> E3a["📁 ProcessOutputChan\n→ processes_*.ndjson"]
-        
-        E6 & E2a & E3a --> E8["🛑 Graceful Shutdown\nSIGINT/SIGTERM\nFlush & Close"]
-        E7 --> E8
-    end
+- Phase 1 builds host identity and application inventory
+- Phase 2 captures live process and network telemetry from ETW
 
-    %% ===== SUPPORTING MODULES =====
-    subgraph Supporting["🔧 Supporting Modules"]
-        F1["config/privilege.go"] -.-> A2
-        F2["config/network.go"] -.-> A5
-        F3["process/collector.go"] -.-> A8 & D6
-        F4["utils/deviceid.go"] -.-> A3
-        F5["inventory/apps.go"] -.-> A6
-        F6["logger/file_sink.go"] -.-> A4 & E6
-        F7["correlation/engine.go"] -.-> D1
-        F8["output/file_output.go"] -.-> E2a & E3a
-    end
+The current implementation is good enough to produce useful endpoint telemetry today, especially around:
 
-    %% ===== EXTERNAL SYSTEMS =====
-    subgraph External["🌐 External Systems"]
-        G1["🪟 Windows Kernel\nETW Provider"] -.-> B1
-        G2["💾 File System\nPath/Hash Lookup"] -.-> D6
-        G3["🌍 DNS Resolver\nAsync Cache"] -.-> D9
-        G4["☁️ Cloud SIEM\nNDJSON Consumer"] -.-> E7
-    end
+- process lifecycle
+- parent-child execution context
+- process-to-network correlation
+- NDJSON output for later backend ingestion
 
-    %% ===== STYLING =====
-    classDef phase1 fill:#e1f5ff,stroke:#0066cc,stroke-width:2px
-    classDef phase2 fill:#fff4e1,stroke:#cc6600,stroke-width:2px
-    classDef correlation fill:#f0e1ff,stroke:#6600cc,stroke-width:2px
-    classDef output fill:#e1ffe1,stroke:#00cc00,stroke-width:2px
-    classDef support fill:#ffe1e1,stroke:#cc0000,stroke-width:2px
-    classDef external fill:#f5f5f5,stroke:#666,stroke-width:1px,stroke-dasharray:3
-    
-    class A1,A2,A3,A4,A5,A6,A6a,A6b,A6c,A7,A8,P1_DONE phase1
-    class B1,B2,B3,B4,B5,B6,B7,B8,C1,C2,C3 phase2
-    class D1,D2,D3,D4,D5,D6,D7,D8,D9,D10,D11,D12 correlation
-    class E1,E2,E2a,E3,E3a,E4,E5,E6,E7,E8 output
-    class F1,F2,F3,F4,F5,F6,F7,F8 support
-    class G1,G2,G3,G4 external
-    ```
+## Phase 1
+
+Phase 1 is the static host visibility layer.
+
+What it does:
+
+- generates a stable device ID
+- enumerates installed applications from the registry
+- extracts publisher, version, uninstall data, install location, and size hints
+- applies app-level risk heuristics
+- writes inventory records to `apps_<device>_<date>.ndjson`
+
+Primary files:
+
+- [D:\Project\Exionis-swg\agent\internal\utils\deviceid.go](D:/Project/Exionis-swg/agent/internal/utils/deviceid.go)
+- [D:\Project\Exionis-swg\agent\internal\inventory\apps.go](D:/Project/Exionis-swg/agent/internal/inventory/apps.go)
+- [D:\Project\Exionis-swg\agent\internal\output\file_output.go](D:/Project/Exionis-swg/agent/internal/output/file_output.go)
+
+## Phase 2
+
+Phase 2 is the live telemetry layer.
+
+What it does:
+
+- starts the `NT Kernel Logger`
+- captures process start and stop ETW events
+- captures TCP and UDP ETW events
+- correlates process and network activity
+- enriches processes with file and user metadata
+- emits structured records to stdout and NDJSON files
+
+Primary files:
+
+- [D:\Project\Exionis-swg\agent\internal\etw\etw_bridge.c](D:/Project/Exionis-swg/agent/internal/etw/etw_bridge.c)
+- [D:\Project\Exionis-swg\agent\internal\etw\etw_native_engine.go](D:/Project/Exionis-swg/agent/internal/etw/etw_native_engine.go)
+- [D:\Project\Exionis-swg\agent\internal\correlation\engine.go](D:/Project/Exionis-swg/agent/internal/correlation/engine.go)
+- [D:\Project\Exionis-swg\agent\internal\process\collector.go](D:/Project/Exionis-swg/agent/internal/process/collector.go)
+
+## What Was Fixed Recently
+
+This part matters because it explains why the current process pipeline is now trustworthy.
+
+The main repairs were:
+
+1. native process decode in C now recognizes `DC_START` and `DC_END`
+2. PID extraction became version-aware
+3. process stop detail includes image data when ETW provides it
+4. the Go ETW bridge stopped sending unrelated ETW traffic into the process channel
+5. the correlation engine now starts before ETW starts sending events
+6. the process-start deadlock in `HandleProcessStart()` was removed
+7. aggressive spawn aggregation was relaxed
+8. stop fallback was improved so process stop rows can recover image and parent context even when the process is already gone
+
+## Process Genealogy
+
+Yes, process genealogy is implemented now.
+
+Current genealogy fields in the runtime event model:
+
+- `ppid`
+- `parent_image`
+- `grandparent_image`
+- `chain`
+- `depth`
+
+This is already useful for chains like:
+
+- `explorer.exe > Codex.exe > powershell.exe`
+- `powershell.exe > Notepad.exe`
+- `Codex.exe > powershell.exe > conhost.exe`
+
+That makes the agent much more useful for:
+
+- LOLBins
+- script abuse
+- macro malware
+- persistence chains
+- lateral movement
+- ransomware ancestry
+
+One honest limitation remains:
+
+- the process output file currently persists `ppid` and `parent_image`
+- the richer `chain`, `grandparent_image`, and `depth` fields are present in the live structured event path, but not yet in the dedicated process NDJSON schema
+
+## Current Workflow
+
+The live workflow is:
+
+1. initialize device ID, sinks, and privileges
+2. run app inventory
+3. build the initial process table
+4. start the correlation engine
+5. start the ETW listener
+6. receive ETW callbacks in C
+7. translate them into Go events
+8. correlate, enrich, and emit process and network telemetry
+
+## Output Files
+
+Phase 1 output:
+
+- `C:\ProgramData\Exionis\output\apps_<device_id>_<date>.ndjson`
+
+Phase 2 output:
+
+- `C:\ProgramData\Exionis\output\processes_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\network_<device_id>_<date>.ndjson`
+
+Combined sink:
+
+- `C:\ProgramData\Exionis\logs\agent.ndjson`
+
+## Current Architecture Assessment
+
+The directory structure is acceptable for the current stage:
+
+- `cmd/agent` as entrypoint
+- `internal/etw` for native capture
+- `internal/correlation` for runtime logic
+- `internal/process` for metadata helpers
+- `internal/inventory` for Phase 1 inventory
+- `internal/output` and `internal/logger` for persistence
+
+The main thing that will hurt future scale is:
+
+- [D:\Project\Exionis-swg\agent\internal\correlation\engine.go](D:/Project/Exionis-swg/agent/internal/correlation/engine.go)
+
+That file currently owns too much of the system.
+
+## Recommended Future Structure
+
+For cleaner scale, move toward:
+
+```text
+agent/
+  cmd/agent/
+  internal/
+    intake/etw/
+    lineage/
+    process/
+    network/
+    enrich/
+    detect/
+    sink/
+    inventory/
+    config/
+```
+
+Best next refactor:
+
+1. extract a dedicated `lineage` package
+2. store process instances by `PID + StartTime`
+3. reconstruct ancestry from registry state instead of relying mostly on flat strings
+4. keep `detect` logic separate from capture and correlation
+
+That is the direction you want if the end goal is deep execution trees like:
+
+- `winword.exe > cmd.exe > powershell.exe > certutil.exe`
+
+## Mermaid Files
+
+Updated raw Mermaid source is stored here:
+
+- [D:\Project\Exionis-swg\architecture.mmd](D:/Project/Exionis-swg/architecture.mmd)
+- [D:\Project\Exionis-swg\Architecutr_worflow\project_workflow.mmd](D:/Project/Exionis-swg/Architecutr_worflow/project_workflow.mmd)
+- [D:\Project\Exionis-swg\Architecutr_worflow\process_genealogy.mmd](D:/Project/Exionis-swg/Architecutr_worflow/process_genealogy.mmd)
+
+These are raw Mermaid files without code fences, so they work better with Mermaid live editors.

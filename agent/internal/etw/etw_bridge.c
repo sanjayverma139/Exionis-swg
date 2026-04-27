@@ -214,8 +214,10 @@ static const char* exionis_provider_name(const GUID* id) {
 }
 
 static const char* exionis_process_event_type(UCHAR opcode) {
-    if (opcode == EVENT_TRACE_TYPE_START) return "PROCESS_START";
-    if (opcode == EVENT_TRACE_TYPE_END) return "PROCESS_STOP";
+    if (opcode == EVENT_TRACE_TYPE_START)    return "PROCESS_START";
+    if (opcode == EVENT_TRACE_TYPE_DC_START) return "PROCESS_START";  // already-running processes
+    if (opcode == EVENT_TRACE_TYPE_END)      return "PROCESS_STOP";
+    if (opcode == EVENT_TRACE_TYPE_DC_END)   return "PROCESS_STOP";   // exit during enumeration
     return NULL;
 }
 
@@ -263,8 +265,8 @@ static void exionis_format_detail(const EVENT_RECORD* rec, const char* provider_
     const BYTE* data = (const BYTE*)rec->UserData;
     const ULONG datalen = (ULONG)rec->UserDataLength;
     const UCHAR version = rec->EventHeader.EventDescriptor.Version;
-    if (IsEqualGUID(id, &EXIONIS_PROCESS_GUID)) {
-        if (opcode == EVENT_TRACE_TYPE_START) {
+   if (IsEqualGUID(id, &EXIONIS_PROCESS_GUID)) {
+        if (opcode == EVENT_TRACE_TYPE_START || opcode == EVENT_TRACE_TYPE_DC_START) {
             ULONG ppid = exionis_extract_ppid(data, datalen, version);
             char image[520];
             exionis_extract_image(data, datalen, version, image, sizeof(image));
@@ -272,9 +274,11 @@ static void exionis_format_detail(const EVENT_RECORD* rec, const char* provider_
             buf[buf_size - 1] = '\0';
             return;
         }
-        if (opcode == EVENT_TRACE_TYPE_END) {
+        if (opcode == EVENT_TRACE_TYPE_END || opcode == EVENT_TRACE_TYPE_DC_END) {
             ULONG ppid = exionis_extract_ppid(data, datalen, version);
-            _snprintf(buf, buf_size, "PPID:%lu", (unsigned long)ppid);
+            char image[520];
+            exionis_extract_image(data, datalen, version, image, sizeof(image));
+            _snprintf(buf, buf_size, "PPID:%lu Image:%s", (unsigned long)ppid, image[0] ? image : "<unknown>");
             buf[buf_size - 1] = '\0';
             return;
         }
@@ -297,13 +301,42 @@ static VOID WINAPI exionis_event_record_callback(PEVENT_RECORD record) {
     const ULONG datalen = (ULONG)record->UserDataLength;
 
     /* Process Events */
+    /* Inside exionis_event_record_callback, PROCESS_GUID branch */
+    /* Process Events */
+        /* Process Events */
     if (IsEqualGUID(provider_id, &EXIONIS_PROCESS_GUID)) {
         const char* event_type = exionis_process_event_type(opcode);
-        if (event_type == NULL) return;
+        if (event_type == NULL) {
+            fprintf(stderr, "[ETW-DBG] PROCESS opcode=%u -> NULL, skipping\n", (unsigned)opcode);
+            fflush(stderr);
+            return;
+        }
+        
         char detail[512];
         exionis_format_detail(record, "Process", detail, sizeof(detail));
+        
+        /* FIX: PID extraction — DC_START/DC_END use EventHeader.ProcessId directly */
         ULONG correct_pid = record->EventHeader.ProcessId;
-        if (data != NULL && datalen >= 16) { memcpy(&correct_pid, data + 8, sizeof(ULONG)); }
+        const BYTE* data = (const BYTE*)record->UserData;
+        const ULONG datalen = (ULONG)record->UserDataLength;
+        const UCHAR ver = record->EventHeader.EventDescriptor.Version;
+        
+        /* Only read PID from UserData for regular START/END events (not enumeration) */
+        if (data != NULL && 
+            opcode != EVENT_TRACE_TYPE_DC_START && 
+            opcode != EVENT_TRACE_TYPE_DC_END) {
+            ULONG pid_offset = (ver >= 3) ? 8 : 4;
+            if (datalen >= pid_offset + sizeof(ULONG)) {
+                memcpy(&correct_pid, data + pid_offset, sizeof(ULONG));
+            }
+        }
+        
+        /* Debug log */
+        fprintf(stderr, "[ETW-DBG] PROCESS %s: pid=%lu opcode=%u ver=%u detail=\"%s\"\n",
+                event_type, (unsigned long)correct_pid, (unsigned)opcode, 
+                (unsigned)ver, detail);
+        fflush(stderr);
+        
         exionis_go_emit_event(correct_pid, record->EventHeader.ThreadId,
             record->EventHeader.EventDescriptor.Id, opcode,
             (unsigned long long)record->EventHeader.TimeStamp.QuadPart,
@@ -355,7 +388,10 @@ static VOID WINAPI exionis_event_record_callback(PEVENT_RECORD record) {
  * Trace Session Properties Allocation
  * ============================================================================*/
 static EVENT_TRACE_PROPERTIES* exionis_alloc_properties(void) {
-    const size_t name_bytes = sizeof(g_session_name);
+    // Use wcslen to get actual string length in characters, then convert to bytes.
+    // sizeof(g_session_name) gives total buffer size, NOT the string length — that was the bug.
+    const size_t name_chars = wcslen(g_session_name) + 1;  // +1 for null terminator
+    const size_t name_bytes = name_chars * sizeof(WCHAR);
     size_t total = sizeof(EVENT_TRACE_PROPERTIES) + name_bytes;
     if (total < EXIONIS_TRACE_BUFFER_SIZE) total = EXIONIS_TRACE_BUFFER_SIZE;
     EVENT_TRACE_PROPERTIES* p = (EVENT_TRACE_PROPERTIES*)calloc(1, total);
@@ -363,10 +399,11 @@ static EVENT_TRACE_PROPERTIES* exionis_alloc_properties(void) {
     p->Wnode.BufferSize = (ULONG)total;
     p->Wnode.Guid = EXIONIS_SYSTEM_TRACE_CONTROL_GUID;
     p->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    p->Wnode.ClientContext = 2;
+    p->Wnode.ClientContext = 1;
     p->LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
     p->EnableFlags = EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD |
                      EVENT_TRACE_FLAG_IMAGE_LOAD | EVENT_TRACE_FLAG_NETWORK_TCPIP;
+    p->FlushTimer = 1;
     p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
     memcpy((BYTE*)p + p->LoggerNameOffset, g_session_name, name_bytes);
     return p;
@@ -379,8 +416,28 @@ ULONG exionis_start_kernel_trace(void) {
     EVENT_TRACE_PROPERTIES* p = exionis_alloc_properties();
     if (!p) return ERROR_OUTOFMEMORY;
     ULONG status = StartTraceW(&g_session_handle, g_session_name, p);
-    if (status == ERROR_SUCCESS) { g_session_owned = 1; }
-    else if (status == ERROR_ALREADY_EXISTS) { g_session_owned = 0; status = ERROR_SUCCESS; }
+
+    // ✅ DEBUG: Print actual EnableFlags used
+    fprintf(stderr, "[ETW-INIT] EnableFlags=0x%08x (PROCESS=0x100, NETWORK=0x10000)\n", 
+            (unsigned)p->EnableFlags);
+    fflush(stderr);
+
+
+    if (status == ERROR_SUCCESS) {
+        g_session_owned = 1;
+    } else if (status == ERROR_ALREADY_EXISTS) {
+        // Session exists — query it to get the real session handle,
+        // then update EnableFlags so PROCESS events are definitely enabled.
+        free(p);
+        p = exionis_alloc_properties();
+        if (!p) return ERROR_OUTOFMEMORY;
+        ControlTraceW(0, g_session_name, p, EVENT_TRACE_CONTROL_QUERY);
+        g_session_handle = p->Wnode.HistoricalContext;
+        p->EnableFlags |= EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_NETWORK_TCPIP;
+        ControlTraceW(g_session_handle, g_session_name, p, EVENT_TRACE_CONTROL_UPDATE);
+        g_session_owned = 0;
+        status = ERROR_SUCCESS;
+    }
     free(p);
     return status;
 }

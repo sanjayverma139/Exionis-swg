@@ -20,7 +20,9 @@ const (
 	StateUnknown                     = "unknown"
 )
 
-// ProcessInfo holds enriched process metadata
+// ============================================================================
+// PROCESS INFO (with genealogy + risk fields added)
+// ============================================================================
 type ProcessInfo struct {
 	PID         uint32
 	PPID        uint32
@@ -30,46 +32,70 @@ type ProcessInfo struct {
 	StartTime   time.Time
 	EndTime     time.Time
 	IsAlive     bool
-	IsOrphan    bool   // ← ADD THIS
-	Username    string // ← ADD THIS
+	IsOrphan    bool
+	Username    string
 	Parent      *ProcessInfo
 	Children    []*ProcessInfo
 	Enrichment  ProcessEnrichment
 	Connections []*ConnectionInfo
 	connMu      sync.RWMutex
+
+	// === GENEALOGY FIELDS (Phase 1.5) ===
+	ParentImage      string
+	GrandParentImage string
+	RootPID          uint32
+	Depth            int
+	Chain            string // "explorer.exe > cmd.exe > powershell.exe"
+
+	// === RISK SCORING FIELDS (non-blocking, informational) ===
+	RiskScore   int
+	RiskReasons []string
 }
 
-// ProcessEnrichment holds async-resolved metadata
+// ============================================================================
+// PROCESS ENRICHMENT (unchanged, just confirming fields)
+// ============================================================================
 type ProcessEnrichment struct {
 	ExecutablePath string `json:"executable_path,omitempty"`
 	SHA256Hash     string `json:"sha256_hash,omitempty"`
 	IsSigned       bool   `json:"is_signed"`
 	IsSystem       bool   `json:"is_system"`
 	UserSID        string `json:"user_sid,omitempty"`
-	Username       string `json:"username,omitempty"`   // ← ADD
-	SizeBytes      int64  `json:"size_bytes,omitempty"` // ← ADD
-	SizeKB         int64  `json:"size_kb,omitempty"`    // ← ADD
-	IsOrphan       bool   `json:"is_orphan,omitempty"`  // ← ADD
+	Username       string `json:"username,omitempty"`
+	SizeBytes      int64  `json:"size_bytes,omitempty"`
+	SizeKB         int64  `json:"size_kb,omitempty"`
+	IsOrphan       bool   `json:"is_orphan,omitempty"`
 }
 
-// StructuredEvent is the unified output format
+// ============================================================================
+// STRUCTURED EVENT (with genealogy + risk fields added)
+// ============================================================================
 type StructuredEvent struct {
-	EventType   string            `json:"event_type"`
-	Timestamp   time.Time         `json:"timestamp"`
-	PID         uint32            `json:"pid"`
-	PPID        uint32            `json:"ppid,omitempty"`
-	Image       string            `json:"image"`
-	ParentImage string            `json:"parent_image,omitempty"`
-	Cmdline     string            `json:"cmdline,omitempty"`
-	ImagePath   string            `json:"image_path,omitempty"`
-	DurationMs  int64             `json:"duration_ms,omitempty"`
-	IsAlive     bool              `json:"is_alive"`
-	Resolved    bool              `json:"resolved"`
-	Enrichment  ProcessEnrichment `json:"enrichment,omitempty"`
-	SequenceID  uint64            `json:"-"`
+	EventType        string            `json:"event_type"`
+	Timestamp        time.Time         `json:"timestamp"`
+	PID              uint32            `json:"pid"`
+	PPID             uint32            `json:"ppid,omitempty"`
+	Image            string            `json:"image"`
+	ParentImage      string            `json:"parent_image,omitempty"`
+	GrandParentImage string            `json:"grandparent_image,omitempty"`
+	Chain            string            `json:"chain,omitempty"`
+	Depth            int               `json:"depth,omitempty"`
+	Cmdline          string            `json:"cmdline,omitempty"`
+	ImagePath        string            `json:"image_path,omitempty"`
+	DurationMs       int64             `json:"duration_ms,omitempty"`
+	IsAlive          bool              `json:"is_alive"`
+	Resolved         bool              `json:"resolved"`
+	Enrichment       ProcessEnrichment `json:"enrichment,omitempty"`
+	SequenceID       uint64            `json:"-"`
+
+	// === RISK SCORING FIELDS (non-blocking, informational) ===
+	RiskScore   int      `json:"risk_score,omitempty"`
+	RiskReasons []string `json:"risk_reasons,omitempty"`
 }
 
-// CorrelatedEvent is legacy format for backward compatibility
+// ============================================================================
+// CORRELATED EVENT (legacy format - unchanged)
+// ============================================================================
 type CorrelatedEvent struct {
 	Type        string
 	PID         uint32
@@ -85,7 +111,9 @@ type CorrelatedEvent struct {
 	Summary     string
 }
 
-// SpawnStats tracks process spawn aggregation with eviction support
+// ============================================================================
+// SPAWN STATS (unchanged)
+// ============================================================================
 type SpawnStats struct {
 	ParentImage string
 	ChildImage  string
@@ -95,7 +123,9 @@ type SpawnStats struct {
 	WindowStart time.Time
 }
 
-// ConnectionInfo holds network connection metadata with state tracking
+// ============================================================================
+// CONNECTION INFO (unchanged)
+// ============================================================================
 type ConnectionInfo struct {
 	RemoteIP   string          `json:"remote_ip"`
 	RemotePort uint16          `json:"remote_port"`
@@ -105,8 +135,12 @@ type ConnectionInfo struct {
 	FirstSeen  time.Time       `json:"first_seen"`
 	LastSeen   time.Time       `json:"last_seen"`
 	Domain     string          `json:"domain,omitempty"`
-	State      ConnectionState `json:"state"` // ✅ NEW: Connection state machine
+	State      ConnectionState `json:"state"`
 }
+
+// ============================================================================
+// CONNECTION METHODS (unchanged - preserves existing behavior)
+// ============================================================================
 
 // UpsertConnection adds or updates a connection record with state merging
 func (p *ProcessInfo) UpsertConnection(conn *ConnectionInfo) {
@@ -123,7 +157,7 @@ func (p *ProcessInfo) UpsertConnection(conn *ConnectionInfo) {
 			if existing.Domain == "" && conn.Domain != "" {
 				existing.Domain = conn.Domain
 			}
-			// ✅ Preserve state unless new state is more definitive
+			// Preserve state unless new state is more definitive
 			if conn.State != StateUnknown && conn.State != existing.State {
 				existing.State = conn.State
 			}

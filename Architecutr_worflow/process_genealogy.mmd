@@ -1,0 +1,18 @@
+flowchart TD
+    A["ETW PROCESS_START and PROCESS_STOP"] --> B["Parse PID, PPID, and Image"]
+    B --> C["Lookup processTable"]
+    C --> D["Build lineage context"]
+
+    D --> E["ParentImage"]
+    D --> F["GrandParentImage"]
+    D --> G["Chain"]
+    D --> H["Depth"]
+    D --> I["RootPID"]
+
+    I --> J["Structured process_start or process_stop event"]
+    J --> K["stdout JSON"]
+    J --> L["processes_*.ndjson"]
+
+    C --> M["Late stop without active entry"]
+    M --> N["Resolve from ETW stop detail, snapshot, and PID cache"]
+    N --> D

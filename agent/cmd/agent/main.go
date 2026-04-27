@@ -84,15 +84,8 @@ func main() {
 	fmt.Println("[Exionis] Building initial process snapshot...")
 	correlation.PopulateInitialProcessTable()
 	fmt.Println("[Exionis] Snapshot complete.")
-
-	// ── App inventory: run once at startup, then daily at appInventoryHour ─
-	// Running at startup ensures the admin panel has data immediately after
-	// the agent is installed. The daily rescan keeps data fresh without
-	// requiring a reinstall or manual trigger.
-	scanTime := time.Now().Format(time.RFC3339Nano)
-	runAppInventory(outMgr, logSink, deviceID, scanTime)
-
-	go scheduleDailyAppInventory(outMgr, logSink, deviceID, sigChan)
+	corrEngine := correlation.New()
+	go corrEngine.Run(events.ProcessChan)
 
 	// ── ETW kernel listener ───────────────────────────────────────────────
 	fmt.Println("[Exionis] Starting ETW kernel listener...")
@@ -103,8 +96,6 @@ func main() {
 	fmt.Println("[Exionis] Phase 2: Process + Network Telemetry Engine ACTIVE")
 
 	// ── Correlation engine ────────────────────────────────────────────────
-	corrEngine := correlation.New()
-	go corrEngine.Run(events.ProcessChan)
 
 	// ── Stats ticker ──────────────────────────────────────────────────────
 	go func() {

@@ -1,0 +1,62 @@
+flowchart TD
+    A["cmd/agent/main.go"] --> B["Init device ID, sinks, and output manager"]
+    B --> C["Enable privileges and load network config"]
+    C --> D["PopulateInitialProcessTable()"]
+    D --> E["Start correlation engine"]
+    E --> F["Start ETW listener"]
+
+    subgraph ETW["ETW Capture Layer"]
+        F --> G["internal/etw/etw_bridge.c"]
+        G --> H["internal/etw/etw_native_engine.go"]
+        H --> I["events.ProcessChan"]
+        H --> J["events.NetworkChan"]
+    end
+
+    subgraph PROC["Process Correlation and Genealogy"]
+        D --> K["processTable bootstrap state"]
+        I --> L["HandleProcessStart()"]
+        I --> M["HandleProcessStop()"]
+
+        L --> N["parseProcessDetail(PPID and Image)"]
+        N --> O["buildGenealogyChain()"]
+        O --> P["ParentImage / GrandParentImage / Chain / Depth / RootPID"]
+        P --> Q["processTable update"]
+        Q --> R["emitProcessStart()"]
+
+        M --> S["lookup existing process"]
+        S --> T["fallback resolution for late stop"]
+        T --> U["ETW stop detail + PID cache + snapshot lookup"]
+        U --> V["rebuild stop genealogy"]
+        V --> W["emitProcessStop()"]
+    end
+
+    subgraph NET["Network Correlation"]
+        J --> X["forwardNetworkEvents()"]
+        X --> Y["attach process context from processTable"]
+        Y --> Z["emitNetworkEvent()"]
+    end
+
+    subgraph ENRICH["Enrichment and Scoring"]
+        R --> AA["async enrichment"]
+        W --> AA
+        AA --> AB["exe path / hash / signature / user / system checks"]
+        R --> AC["risk scoring"]
+        W --> AC
+        R --> AD["spawn aggregation"]
+    end
+
+    subgraph OUT["Output Pipeline"]
+        R --> AE["nonBlockingEmit()"]
+        W --> AE
+        Z --> AE
+        AA --> AE
+
+        AE --> AF["stdout JSON"]
+        AE --> AG["StructuredOutput channel"]
+        AG --> AH["internal/output/file_output.go"]
+        AG --> AI["internal/logger/file_sink.go"]
+
+        AH --> AJ["processes_*.ndjson"]
+        AH --> AK["network_*.ndjson"]
+        AH --> AL["apps_*.ndjson"]
+    end
