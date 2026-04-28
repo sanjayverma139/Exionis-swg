@@ -39,7 +39,7 @@ flowchart TD
     subgraph ENRICH["Enrichment and Scoring"]
         R --> AA["async enrichment"]
         W --> AA
-        AA --> AB["exe path / hash / signature / user / system checks"]
+        AA --> AB["exe path / hash / user / system checks"]
         R --> AC["risk scoring"]
         W --> AC
         R --> AD["spawn aggregation"]

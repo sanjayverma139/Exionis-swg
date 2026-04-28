@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -29,12 +28,12 @@ type ProcessInfo struct {
 //
 // FIX: Removed the unconditional time.Sleep(500ms) that was called on every
 // invocation. The sleep was added for CPU% measurement stability but:
-//   1. We call this every 5 seconds from the snapshot ticker — 500ms of
-//      blocking per tick is wasteful.
-//   2. Bootstrap calls this twice (via BuildLivePIDSet + PopulateInitialProcessTable)
-//      causing 1 full second of startup delay.
-//   3. CPU% measurement with gopsutil already uses an internal interval when
-//      you call CPUPercent() — the external sleep was redundant and harmful.
+//  1. We call this every 5 seconds from the snapshot ticker — 500ms of
+//     blocking per tick is wasteful.
+//  2. Bootstrap calls this twice (via BuildLivePIDSet + PopulateInitialProcessTable)
+//     causing 1 full second of startup delay.
+//  3. CPU% measurement with gopsutil already uses an internal interval when
+//     you call CPUPercent() — the external sleep was redundant and harmful.
 func GetProcesses() []ProcessInfo {
 	var result []ProcessInfo
 	procs, err := process.Processes()
@@ -165,18 +164,6 @@ func GetProcessNameByPID(pid uint32) string {
 		return ""
 	}
 	return name
-}
-
-// IsProcessSigned checks if a process executable is in a Windows system path.
-// This is a fast heuristic — full Authenticode verification is a Phase 3 item.
-func IsProcessSigned(pid uint32) bool {
-	exePath := GetExecutablePath(pid)
-	if exePath == "" || exePath == "unknown" {
-		return false
-	}
-	lower := strings.ToLower(exePath)
-	return strings.Contains(lower, `c:\windows\system32`) ||
-		strings.Contains(lower, `c:\windows\syswow64`)
 }
 
 // ComputeFileSHA256 computes SHA256 hash of a file (with 100 MB size limit).
@@ -384,7 +371,6 @@ func GetProcessArchitecture(pid uint32) string {
 	}
 	return "unknown"
 }
-
 
 // GetProcessNameFromSnapshot tries to get a process name using ToolHelp32
 // snapshot. Useful for processes that exit before gopsutil can query them.

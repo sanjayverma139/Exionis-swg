@@ -58,7 +58,6 @@ type ProcessInfo struct {
 type ProcessEnrichment struct {
 	ExecutablePath string `json:"executable_path,omitempty"`
 	SHA256Hash     string `json:"sha256_hash,omitempty"`
-	IsSigned       bool   `json:"is_signed"`
 	IsSystem       bool   `json:"is_system"`
 	UserSID        string `json:"user_sid,omitempty"`
 	Username       string `json:"username,omitempty"`

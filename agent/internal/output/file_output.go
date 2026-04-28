@@ -3,8 +3,8 @@
 
 // Package output handles structured file output for cloud sync.
 // Writes two separate NDJSON files:
-//   1. apps_<deviceID>_<date>.ndjson     — installed applications snapshot
-//   2. processes_<deviceID>_<date>.ndjson — real-time process events
+//  1. apps_<deviceID>_<date>.ndjson     — installed applications snapshot
+//  2. processes_<deviceID>_<date>.ndjson — real-time process events
 //
 // Each line is a self-contained JSON record ready for Supabase/cloud ingestion.
 package output
@@ -27,11 +27,11 @@ import (
 // AppRecord is one row in the cloud `installed_apps` table.
 type AppRecord struct {
 	// Cloud sync metadata
-	RecordType  string `json:"record_type"`   // always "installed_app"
-	DeviceID    string `json:"device_id"`     // hardware fingerprint
-	AgentVersion string `json:"agent_version"`
-	ScanTime    string `json:"scan_time"`     // ISO8601 — when this scan ran
-	SchemaVersion int  `json:"schema_version"` // for migration tracking
+	RecordType    string `json:"record_type"` // always "installed_app"
+	DeviceID      string `json:"device_id"`   // hardware fingerprint
+	AgentVersion  string `json:"agent_version"`
+	ScanTime      string `json:"scan_time"`      // ISO8601 — when this scan ran
+	SchemaVersion int    `json:"schema_version"` // for migration tracking
 
 	// App identity
 	DisplayName     string `json:"display_name"`
@@ -47,11 +47,10 @@ type AppRecord struct {
 
 	// Classification
 	IsSystemComponent bool   `json:"is_system_component"`
-	RegistrySource    string `json:"registry_source"`   // HKLM, HKCU, HKLM_WoW64
+	RegistrySource    string `json:"registry_source"`          // HKLM, HKCU, HKLM_WoW64
 	InstallSource     string `json:"install_source,omitempty"` // MSI, InnoSetup, EXE...
 
 	// Security
-	IsSigned  bool   `json:"is_signed"`
 	FileHash  string `json:"file_hash,omitempty"`
 	RiskScore int    `json:"risk_score,omitempty"`
 }
@@ -59,14 +58,14 @@ type AppRecord struct {
 // ProcessRecord is one row in the cloud `process_events` table.
 type ProcessRecord struct {
 	// Cloud sync metadata
-	RecordType    string `json:"record_type"`    // "process_start" | "process_stop" | "process_aggregate"
+	RecordType    string `json:"record_type"` // "process_start" | "process_stop" | "process_aggregate"
 	DeviceID      string `json:"device_id"`
 	AgentVersion  string `json:"agent_version"`
 	SchemaVersion int    `json:"schema_version"`
 
 	// Event identity
-	Timestamp string `json:"timestamp"`   // ISO8601 nanosecond
-	EventSeq  uint64 `json:"event_seq"`   // monotonic sequence for ordering
+	Timestamp string `json:"timestamp"` // ISO8601 nanosecond
+	EventSeq  uint64 `json:"event_seq"` // monotonic sequence for ordering
 
 	// Process identity
 	PID         uint32 `json:"pid"`
@@ -84,7 +83,6 @@ type ProcessRecord struct {
 
 	// Enrichment
 	SHA256Hash string `json:"sha256_hash,omitempty"`
-	IsSigned   bool   `json:"is_signed"`
 	IsSystem   bool   `json:"is_system"`
 	UserSID    string `json:"user_sid,omitempty"`
 
@@ -123,11 +121,11 @@ type NetworkRecord struct {
 // Writer writes NDJSON records to a dedicated file.
 // Thread-safe. New file per day.
 type Writer struct {
-	mu        sync.Mutex
-	dir       string
-	prefix    string // "apps" or "processes" or "network"
-	deviceID  string
-	current   *os.File
+	mu         sync.Mutex
+	dir        string
+	prefix     string // "apps" or "processes" or "network"
+	deviceID   string
+	current    *os.File
 	currentDay string // YYYY-MM-DD — used to detect day rollover
 }
 

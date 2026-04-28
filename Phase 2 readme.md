@@ -80,6 +80,7 @@ Important schema note:
 
 - stdout and the in-memory structured event path carry the richer genealogy fields
 - the persisted process NDJSON schema currently keeps `ppid` and `parent_image`, but not the full `chain` / `depth` set yet
+- process and app outputs no longer include `is_signed`
 
 So the genealogy logic is live, but the durable file schema still has room to grow.
 
@@ -111,6 +112,12 @@ Native ETW layer:
 Correlation and lineage:
 
 - [D:\Project\Exionis-swg\agent\internal\correlation\engine.go](D:/Project/Exionis-swg/agent/internal/correlation/engine.go)
+- [D:\Project\Exionis-swg\agent\internal\correlation\lineage.go](D:/Project/Exionis-swg/agent/internal/correlation/lineage.go)
+- [D:\Project\Exionis-swg\agent\internal\correlation\enrichment.go](D:/Project/Exionis-swg/agent/internal/correlation/enrichment.go)
+- [D:\Project\Exionis-swg\agent\internal\correlation\emitters.go](D:/Project/Exionis-swg/agent/internal/correlation/emitters.go)
+- [D:\Project\Exionis-swg\agent\internal\correlation\aggregation.go](D:/Project/Exionis-swg/agent/internal/correlation/aggregation.go)
+- [D:\Project\Exionis-swg\agent\internal\correlation\maintenance.go](D:/Project/Exionis-swg/agent/internal/correlation/maintenance.go)
+- [D:\Project\Exionis-swg\agent\internal\correlation\risk.go](D:/Project/Exionis-swg/agent/internal/correlation/risk.go)
 - [D:\Project\Exionis-swg\agent\internal\correlation\models.go](D:/Project/Exionis-swg/agent/internal/correlation/models.go)
 
 Process metadata:
@@ -201,7 +208,7 @@ These are still worth keeping in view:
 
 1. full durable lineage persistence is not complete yet because the process file schema does not yet store the entire runtime chain model
 2. very short-lived processes can still have partial start-time enrichment
-3. `engine.go` is carrying too many responsibilities for long-term scale
+3. the correlation package is cleaner now, but long-term scale still points toward a dedicated lineage package
 4. DNS is still enrichment-driven rather than full DNS-client ETW ingestion
 
 ## Best Next Architecture Move
