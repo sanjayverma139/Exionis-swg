@@ -15,7 +15,6 @@ import (
 	"exionis/internal/events"
 )
 
-
 //export exionis_go_emit_event
 func exionis_go_emit_event(
 	pid C.uint,
@@ -81,7 +80,7 @@ func exionis_go_emit_network_event(
 		LocalPort:  uint16(localPort),
 		RemotePort: uint16(remotePort),
 		Protocol:   proto,
-		Direction:  mapOpcodeToDirection(op, proto),
+		Direction:  events.InferDirection(op, proto),
 		BytesSent:  uint64(bytesSent),
 		BytesRecv:  uint64(bytesRecv),
 		Timestamp:  ts,
@@ -105,30 +104,17 @@ func go_is_internal_ip(ip *C.char) C.int {
 // mapOpcodeToDirection converts an ETW TCP/IP opcode to a human-readable direction.
 //
 // ETW kernel TCP/IP provider opcodes (evntcons.h):
-//   10 = Connect    — client initiates outbound connection
-//   11 = Accept     — server accepts inbound connection
-//   12 = Reconnect  — client reconnects (also outbound)
-//   13 = Send       — local side is sending data (outbound)
-//   14 = Receive    — local side is receiving data (inbound)
-//   15 = Disconnect — connection torn down (direction not meaningful)
-//   16 = Retransmit — retransmitting sent data (outbound)
+//
+//	10 = Connect    — client initiates outbound connection
+//	11 = Accept     — server accepts inbound connection
+//	12 = Reconnect  — client reconnects (also outbound)
+//	13 = Send       — local side is sending data (outbound)
+//	14 = Receive    — local side is receiving data (inbound)
+//	15 = Disconnect — connection torn down (direction not meaningful)
+//	16 = Retransmit — retransmitting sent data (outbound)
 //
 // FIX: previous code had opcode 13 (Send) mapped to "inbound" and
 // opcode 14 (Receive) falling through to "unknown". Both were wrong.
-func mapOpcodeToDirection(opcode uint8, protocol string) string {
-	if protocol != "TCP" {
-		return "unknown"
-	}
-	switch opcode {
-	case 10, 12, 13, 16: // Connect, Reconnect, Send, Retransmit
-		return "outbound"
-	case 11, 14: // Accept, Receive
-		return "inbound"
-	default:
-		return "unknown"
-	}
-}
-
 // StartETWListener initializes and starts the ETW kernel trace session.
 func StartETWListener() error {
 	if err := config.InitNetworkConfig(config.DefaultInternalRanges()); err != nil {

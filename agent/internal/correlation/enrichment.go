@@ -154,28 +154,24 @@ func (e *Engine) tryFallbackEnrichment(pid uint32, proc *ProcessInfo) {
 }
 
 func computeSHA256Safe(path string) string {
-	hashSem <- struct{}{}
-	defer func() { <-hashSem }()
-
-	file, err := os.Open(path)
+	hash, err := computeFileSHA256(path)
 	if err != nil {
 		return ""
 	}
-	defer file.Close()
-
-	stat, err := file.Stat()
-	if err != nil || stat.Size() > 100<<20 {
-		return ""
-	}
-
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return ""
-	}
-	return hex.EncodeToString(hasher.Sum(nil))
+	return hash
 }
 
 func computeFileSHA256(path string) (string, error) {
+	hashCacheMu.RLock()
+	if h, ok := hashCache[path]; ok {
+		hashCacheMu.RUnlock()
+		return h, nil
+	}
+	hashCacheMu.RUnlock()
+
+	hashSem <- struct{}{}
+	defer func() { <-hashSem }()
+
 	hashCacheMu.RLock()
 	if h, ok := hashCache[path]; ok {
 		hashCacheMu.RUnlock()

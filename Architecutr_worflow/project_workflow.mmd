@@ -1,62 +1,64 @@
 flowchart TD
-    A["cmd/agent/main.go"] --> B["Init device ID, sinks, and output manager"]
-    B --> C["Enable privileges and load network config"]
-    C --> D["PopulateInitialProcessTable()"]
-    D --> E["Start correlation engine"]
-    E --> F["Start ETW listener"]
+    A["cmd/agent/main.go"] --> B["Resolve device_id and hostname"]
+    B --> C["Load telemetry mode config"]
+    C --> D["Archive previous NDJSON outputs as Old_*"]
+    D --> E["Init sinks and output manager"]
+    E --> F["Enable privileges and load network config"]
+    F --> G["PopulateInitialProcessTable()"]
+    G --> H["Seed telemetry controller with live processes"]
+    H --> I["Start correlation engine"]
+    I --> J["Start ETW listener"]
 
     subgraph ETW["ETW Capture Layer"]
-        F --> G["internal/etw/etw_bridge.c"]
-        G --> H["internal/etw/etw_native_engine.go"]
-        H --> I["events.ProcessChan"]
-        H --> J["events.NetworkChan"]
+        J --> K["internal/etw/etw_bridge.c"]
+        K --> L["internal/etw/etw_native_engine.go"]
+        L --> M["events.ProcessChan"]
+        L --> N["events.NetworkChan"]
     end
 
-    subgraph PROC["Process Correlation and Genealogy"]
-        D --> K["processTable bootstrap state"]
-        I --> L["HandleProcessStart()"]
-        I --> M["HandleProcessStop()"]
-
-        L --> N["parseProcessDetail(PPID and Image)"]
-        N --> O["buildGenealogyChain()"]
-        O --> P["ParentImage / GrandParentImage / Chain / Depth / RootPID"]
-        P --> Q["processTable update"]
-        Q --> R["emitProcessStart()"]
-
-        M --> S["lookup existing process"]
-        S --> T["fallback resolution for late stop"]
-        T --> U["ETW stop detail + PID cache + snapshot lookup"]
-        U --> V["rebuild stop genealogy"]
-        V --> W["emitProcessStop()"]
+    subgraph CORR["Correlation and Genealogy"]
+        M --> O["HandleProcessStart()"]
+        M --> P["HandleProcessStop()"]
+        O --> Q["parseProcessDetail()"]
+        Q --> R["buildGenealogyChain()"]
+        R --> S["Chain / Depth / ParentImage / GrandParentImage"]
+        S --> T["processTable update"]
+        T --> U["StructuredOutput"]
+        P --> V["stop fallback and context rebuild"]
+        V --> U
+        N --> W["forwardNetworkEvents()"]
+        W --> X["network correlation with processTable"]
+        X --> Y["NetworkOutputChan"]
     end
 
-    subgraph NET["Network Correlation"]
-        J --> X["forwardNetworkEvents()"]
-        X --> Y["attach process context from processTable"]
-        Y --> Z["emitNetworkEvent()"]
+    subgraph TELE["Telemetry Shaping"]
+        U --> Z["internal/telemetry/controller.go"]
+        Y --> Z
+        Z --> AA["baseline mode"]
+        Z --> AB["deep mode"]
+
+        AA --> AC["process_execution_*.ndjson"]
+        AA --> AD["process_edge_*.ndjson"]
+        AA --> AE["network_rollup_*.ndjson"]
+        AA --> AF["telemetry_mode_*.ndjson"]
+
+        AB --> AG["deep_capture_*.ndjson.gz"]
+        AB --> AF
     end
 
-    subgraph ENRICH["Enrichment and Scoring"]
-        R --> AA["async enrichment"]
-        W --> AA
-        AA --> AB["exe path / hash / user / system checks"]
-        R --> AC["risk scoring"]
-        W --> AC
-        R --> AD["spawn aggregation"]
+    subgraph PH1["Phase 1 Inventory"]
+        E --> AH["CollectInstalledApps()"]
+        AH --> AI["apps_*.ndjson"]
     end
 
-    subgraph OUT["Output Pipeline"]
-        R --> AE["nonBlockingEmit()"]
-        W --> AE
-        Z --> AE
-        AA --> AE
+    subgraph LEGACY["Optional Compatibility Output"]
+        U --> AJ["processes_*.ndjson only when EXIONIS_WRITE_LEGACY_RAW=1"]
+        Y --> AK["network_*.ndjson only when EXIONIS_WRITE_LEGACY_RAW=1"]
+    end
 
-        AE --> AF["stdout JSON"]
-        AE --> AG["StructuredOutput channel"]
-        AG --> AH["internal/output/file_output.go"]
-        AG --> AI["internal/logger/file_sink.go"]
-
-        AH --> AJ["processes_*.ndjson"]
-        AH --> AK["network_*.ndjson"]
-        AH --> AL["apps_*.ndjson"]
+    subgraph OBS["Operational Logs"]
+        U --> AL["stdout JSON"]
+        Y --> AL
+        AL --> AM["output.log"]
+        E --> AN["agent.ndjson"]
     end

@@ -26,6 +26,9 @@ The latest validated state is:
 - stop-only `unknown_process` noise was eliminated in the latest validated process file
 - process genealogy is present in the live structured event path
 - the `is_signed` feature has been removed from app and process outputs
+- telemetry is now mode-aware with `baseline` and `deep` operating modes
+- baseline mode writes summary-first records instead of raw lifecycle files by default
+- deep mode writes a local gzip forensic capture bundle for later upload
 
 The major fixes behind the current runtime are:
 
@@ -71,7 +74,8 @@ It currently provides:
 - best-effort process enrichment for path, hash, SID, username, and system classification
 - follow-up `process_enrichment_update` events when metadata arrives after start
 - stop fallback recovery using ETW detail, PID caches, and snapshots
-- separated process and network NDJSON outputs
+- mode-aware summary output for baseline operations
+- local deep capture bundles for targeted investigations
 
 Main code paths:
 
@@ -88,6 +92,9 @@ Main code paths:
 - [D:\Project\Exionis-swg\agent\internal\correlation\risk.go](D:/Project/Exionis-swg/agent/internal/correlation/risk.go)
 - [D:\Project\Exionis-swg\agent\internal\correlation\models.go](D:/Project/Exionis-swg/agent/internal/correlation/models.go)
 - [D:\Project\Exionis-swg\agent\internal\process\collector.go](D:/Project/Exionis-swg/agent/internal/process/collector.go)
+- [D:\Project\Exionis-swg\agent\internal\telemetry\config.go](D:/Project/Exionis-swg/agent/internal/telemetry/config.go)
+- [D:\Project\Exionis-swg\agent\internal\telemetry\controller.go](D:/Project/Exionis-swg/agent/internal/telemetry/controller.go)
+- [D:\Project\Exionis-swg\agent\internal\telemetry\types.go](D:/Project/Exionis-swg/agent/internal/telemetry/types.go)
 
 ## Process Genealogy
 
@@ -119,8 +126,9 @@ This is useful for:
 
 Important accuracy note:
 
-- live structured events and stdout include richer genealogy fields such as `grandparent_image`, `chain`, and `depth`
-- the persisted process NDJSON file currently stores `ppid` and `parent_image`, but not the full chain fields
+- live structured events and stdout still carry the richest event-by-event genealogy view
+- baseline persistence now stores genealogy on `process_execution` summary rows through fields such as `parent_image`, `grandparent_image`, `chain`, `depth`, `parent_execution_id`, and `root_execution_id`
+- the old raw `processes_*.ndjson` file is now optional and intended mainly for deep or compatibility scenarios
 
 ## Working Runtime Flow
 
@@ -129,19 +137,23 @@ The current runtime order is:
 1. `main.go` initializes device ID, sinks, config, and privileges.
 2. Phase 1 inventory runs and writes app records.
 3. the initial process table is populated from a live snapshot
-4. the correlation engine starts before ETW
-5. the C ETW bridge starts `NT Kernel Logger`
-6. ETW callbacks are normalized and pushed into Go channels
-7. the correlation engine emits structured process and network events
-8. stdout, the combined sink, and dedicated NDJSON outputs receive the normalized records
+4. the telemetry controller seeds an execution registry for already-running processes
+5. the correlation engine starts before ETW
+6. the C ETW bridge starts `NT Kernel Logger`
+7. ETW callbacks are normalized and pushed into Go channels
+8. the correlation engine emits structured process and network events
+9. baseline mode summarizes them into durable execution, edge, and rollup records
+10. deep mode additionally stores a local gzip forensic bundle for later upload
 
 ## Output Files
 
 Dedicated output files:
 
 - `C:\ProgramData\Exionis\output\apps_<device_id>_<date>.ndjson`
-- `C:\ProgramData\Exionis\output\processes_<device_id>_<date>.ndjson`
-- `C:\ProgramData\Exionis\output\network_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\process_execution_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\process_edge_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\network_rollup_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\telemetry_mode_<device_id>_<date>.ndjson`
 
 Combined operational sink:
 
@@ -149,11 +161,12 @@ Combined operational sink:
 
 Current output behavior:
 
-- process records are written to the process file
-- network records are written to the network file
 - app inventory is written to the app file
+- baseline mode writes summary-first process, edge, network rollup, and mode-audit records
+- legacy raw `processes_*.ndjson` and `network_*.ndjson` are disabled by default and can be re-enabled with `EXIONIS_WRITE_LEGACY_RAW=1`
+- deep mode writes a local `deep_capture_*.ndjson.gz` bundle under `C:\ProgramData\Exionis\deep` by default
 - app and process outputs no longer include `is_signed`
-- the combined sink carries mixed event types for local debugging and bulk export
+- the combined sink is no longer the primary raw event store in baseline mode
 
 ## Build and Run
 
@@ -183,6 +196,19 @@ Recommended test run:
 cd D:\Project\Exionis-swg\agent
 
 Remove-Item .\output.log,.\debug.log -Force -ErrorAction SilentlyContinue
+$env:EXIONIS_TELEMETRY_MODE='baseline'
+$env:EXIONIS_DEBUG='1'
+.\exionis-agent.exe > output.log 2> debug.log
+```
+
+Deep-mode test run:
+
+```powershell
+cd D:\Project\Exionis-swg\agent
+
+Remove-Item .\output.log,.\debug.log -Force -ErrorAction SilentlyContinue
+$env:EXIONIS_TELEMETRY_MODE='deep'
+$env:EXIONIS_DEEP_DURATION_MINUTES='30'
 $env:EXIONIS_DEBUG='1'
 .\exionis-agent.exe > output.log 2> debug.log
 ```
@@ -191,8 +217,10 @@ After that, launch short-lived processes such as `notepad.exe` and `powershell.e
 
 - [D:\Project\Exionis-swg\agent\output.log](D:/Project/Exionis-swg/agent/output.log)
 - [D:\Project\Exionis-swg\agent\debug.log](D:/Project/Exionis-swg/agent/debug.log)
-- `C:\ProgramData\Exionis\output\processes_*.ndjson`
-- `C:\ProgramData\Exionis\output\network_*.ndjson`
+- `C:\ProgramData\Exionis\output\process_execution_*.ndjson`
+- `C:\ProgramData\Exionis\output\process_edge_*.ndjson`
+- `C:\ProgramData\Exionis\output\network_rollup_*.ndjson`
+- `C:\ProgramData\Exionis\deep\deep_capture_*.ndjson.gz`
 
 ## Repository Structure
 
@@ -201,6 +229,7 @@ The current layout is in a better place now:
 - `cmd/agent` is split between orchestration, inventory scheduling, and output workers
 - `internal/etw` isolates native ETW capture
 - `internal/correlation` is split by responsibility instead of depending on one oversized file
+- `internal/telemetry` now owns baseline/deep mode policy, execution summaries, and deep capture lifecycle
 - `internal/process` owns process metadata helpers
 - `internal/output` and `internal/logger` own persistence paths
 - `internal/inventory` owns app inventory
@@ -209,8 +238,9 @@ The key structure improvements already applied are:
 
 - [D:\Project\Exionis-swg\agent\cmd\agent\main.go](D:/Project/Exionis-swg/agent/cmd/agent/main.go) is back to orchestration
 - [D:\Project\Exionis-swg\agent\cmd\agent\inventory_runner.go](D:/Project/Exionis-swg/agent/cmd/agent/inventory_runner.go) owns the inventory flow
-- [D:\Project\Exionis-swg\agent\cmd\agent\output_workers.go](D:/Project/Exionis-swg/agent/cmd/agent/output_workers.go) owns stdout and NDJSON writer loops
+- [D:\Project\Exionis-swg\agent\cmd\agent\output_workers.go](D:/Project/Exionis-swg/agent/cmd/agent/output_workers.go) owns the channel-to-telemetry routing loops
 - the correlation package is split across lineage, enrichment, emitters, risk, aggregation, and maintenance files
+- the telemetry package keeps summary shaping and deep forensic capture out of the ETW and correlation layers
 
 ## Recommended Scale-Up Direction
 
@@ -239,6 +269,12 @@ The highest-value refactor would be:
 2. key process instances by `PID + StartTime`, not PID alone
 3. reconstruct full ancestry on demand instead of relying mostly on prebuilt strings
 4. move rule logic to a future `detect` layer that consumes lineage-aware process objects
+
+## Roadmap
+
+The current delivery roadmap is tracked here:
+
+- [D:\Project\Exionis-swg\ROADMAP.md](D:/Project/Exionis-swg/ROADMAP.md)
 
 That will scale better for:
 

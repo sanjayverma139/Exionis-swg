@@ -17,6 +17,7 @@ import (
 	"exionis/internal/logger"
 	"exionis/internal/output"
 	"exionis/internal/process"
+	"exionis/internal/telemetry"
 	"exionis/internal/utils"
 )
 
@@ -36,6 +37,13 @@ func main() {
 		fmt.Printf("[Warn] Device ID: %v\n", err)
 		deviceID = "unknown"
 	}
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "unknown-host"
+	}
+
+	telemetryCfg := telemetry.LoadConfig()
+	bootID := telemetry.BuildBootID()
 
 	logSink, err := logger.NewFileSink(`C:\ProgramData\Exionis\logs`, "agent", 100, 10)
 	if err != nil {
@@ -47,7 +55,7 @@ func main() {
 		}
 	}()
 
-	outMgr, err := output.NewManager(`C:\ProgramData\Exionis\output`, deviceID, agentVersion)
+	outMgr, err := output.NewManager(telemetryCfg.BaselineDir, deviceID, hostname, agentVersion)
 	if err != nil {
 		fmt.Printf("[Warn] Output manager: %v\n", err)
 	}
@@ -71,12 +79,22 @@ func main() {
 	correlation.PopulateInitialProcessTable()
 	fmt.Println("[Exionis] Snapshot complete.")
 
+	telemetryController, err := telemetry.NewController(telemetryCfg, outMgr, logSink, deviceID, hostname, agentVersion, policyVersion, bootID)
+	if err != nil {
+		fmt.Printf("[Warn] Telemetry controller: %v\n", err)
+	}
+	if telemetryController != nil {
+		telemetryController.SeedFromLiveProcesses()
+		telemetryController.Start()
+		defer telemetryController.Shutdown()
+	}
+
 	corrEngine := correlation.New()
 	go corrEngine.Run(events.ProcessChan)
 
 	scanTime := time.Now().Format(time.RFC3339Nano)
-	runAppInventory(outMgr, logSink, deviceID, scanTime)
-	go scheduleDailyAppInventory(outMgr, logSink, deviceID, shutdown)
+	runAppInventory(outMgr, logSink, deviceID, hostname, scanTime)
+	go scheduleDailyAppInventory(outMgr, logSink, deviceID, hostname, shutdown)
 
 	fmt.Println("[Exionis] Starting ETW kernel listener...")
 	if err := etw.StartETWListener(); err != nil {
@@ -95,8 +113,7 @@ func main() {
 		}
 	}()
 
-	startStructuredOutputWriter(outMgr, logSink, deviceID)
-	startNetworkOutputWriter(outMgr, logSink, deviceID)
+	startTelemetryWorkers(telemetryController, outMgr, logSink, deviceID, hostname, telemetryCfg)
 
 	fmt.Println("[Exionis] Process Collector Running...")
 	snapshotTicker := time.NewTicker(5 * time.Second)

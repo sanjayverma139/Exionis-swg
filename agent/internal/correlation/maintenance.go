@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"exionis/internal/process"
 )
 
 func runMaintenanceTicker() {
@@ -37,6 +39,7 @@ func cleanupStaleProcesses() {
 	if debugMode && cleaned > 0 {
 		fmt.Fprintf(os.Stderr, "[cleanup] removed %d stale processes\n", cleaned)
 	}
+	// PID history uses its own mutex, so keep the cleanup call here explicit.
 	cleanupPIDHistory()
 }
 
@@ -114,4 +117,4 @@ func deleteProcessSafe(pid uint32) {
 	delete(processTable, pid)
 }
 
-func resolveProcessSID(pid uint32) string { return "" }
+func resolveProcessSID(pid uint32) string { return process.GetProcessUserSID(pid) }

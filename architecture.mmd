@@ -1,62 +1,31 @@
 flowchart TD
-    A["cmd/agent/main.go"] --> B["Init device ID, sinks, and output manager"]
-    B --> C["Enable privileges and load network config"]
-    C --> D["PopulateInitialProcessTable()"]
-    D --> E["Start correlation engine"]
-    E --> F["Start ETW listener"]
+    A["Windows Endpoint"] --> B["Phase 1 App Inventory"]
+    A --> C["Phase 2 ETW Capture"]
 
-    subgraph ETW["ETW Capture Layer"]
-        F --> G["internal/etw/etw_bridge.c"]
-        G --> H["internal/etw/etw_native_engine.go"]
-        H --> I["events.ProcessChan"]
-        H --> J["events.NetworkChan"]
-    end
+    B --> D["apps_*.ndjson"]
 
-    subgraph PROC["Process Correlation and Genealogy"]
-        D --> K["processTable bootstrap state"]
-        I --> L["HandleProcessStart()"]
-        I --> M["HandleProcessStop()"]
+    C --> E["Process lifecycle events"]
+    C --> F["Network events"]
 
-        L --> N["parseProcessDetail(PPID and Image)"]
-        N --> O["buildGenealogyChain()"]
-        O --> P["ParentImage / GrandParentImage / Chain / Depth / RootPID"]
-        P --> Q["processTable update"]
-        Q --> R["emitProcessStart()"]
+    E --> G["Correlation engine"]
+    F --> G
 
-        M --> S["lookup existing process"]
-        S --> T["fallback resolution for late stop"]
-        T --> U["ETW stop detail + PID cache + snapshot lookup"]
-        U --> V["rebuild stop genealogy"]
-        V --> W["emitProcessStop()"]
-    end
+    G --> H["Telemetry controller"]
+    H --> I["Baseline mode"]
+    H --> J["Deep mode"]
 
-    subgraph NET["Network Correlation"]
-        J --> X["forwardNetworkEvents()"]
-        X --> Y["attach process context from processTable"]
-        Y --> Z["emitNetworkEvent()"]
-    end
+    I --> K["process_execution"]
+    I --> L["process_edge"]
+    I --> M["network_rollup"]
+    I --> N["telemetry_mode"]
+    I --> O["hostname + device_id tagged records"]
 
-    subgraph ENRICH["Enrichment and Scoring"]
-        R --> AA["async enrichment"]
-        W --> AA
-        AA --> AB["exe path / hash / user / system checks"]
-        R --> AC["risk scoring"]
-        W --> AC
-        R --> AD["spawn aggregation"]
-    end
+    J --> P["deep_capture_*.ndjson.gz"]
+    J --> N
 
-    subgraph OUT["Output Pipeline"]
-        R --> AE["nonBlockingEmit()"]
-        W --> AE
-        Z --> AE
-        AA --> AE
-
-        AE --> AF["stdout JSON"]
-        AE --> AG["StructuredOutput channel"]
-        AG --> AH["internal/output/file_output.go"]
-        AG --> AI["internal/logger/file_sink.go"]
-
-        AH --> AJ["processes_*.ndjson"]
-        AH --> AK["network_*.ndjson"]
-        AH --> AL["apps_*.ndjson"]
-    end
+    K --> Q["Admin dashboard timeline"]
+    L --> R["Execution flow graph"]
+    M --> S["Destination and traffic view"]
+    D --> T["Installed apps and shadow IT view"]
+    N --> U["Telemetry audit view"]
+    P --> V["On-demand forensic upload"]

@@ -183,7 +183,7 @@ func PopulateInitialProcessTable() {
 }
 
 func (e *Engine) Run(src <-chan events.EventInput) {
-	go runPendingResolver()
+	go e.runPendingResolver()
 	go runMaintenanceTicker()
 	go e.forwardNetworkEvents()
 
@@ -199,12 +199,8 @@ func (e *Engine) Run(src <-chan events.EventInput) {
 
 func (e *Engine) forwardNetworkEvents() {
 	for netEvt := range events.NetworkChan {
-		if netEvt.RemoteIP != "" && netEvt.Protocol == "TCP" {
-			go func(ip string, evt *events.NetworkEvent) {
-				if domain := ResolveDomain(ip); domain != "" {
-					evt.Domain = domain
-				}
-			}(netEvt.RemoteIP, &netEvt)
+		if netEvt.Domain == "" && netEvt.RemoteIP != "" && netEvt.Protocol == "TCP" {
+			netEvt.Domain = ResolveDomain(netEvt.RemoteIP)
 		}
 
 		tableMu.RLock()
@@ -230,7 +226,7 @@ func (e *Engine) forwardNetworkEvents() {
 		}
 
 		if netEvt.Direction == "" && netEvt.Protocol == "TCP" {
-			netEvt.Direction = mapOpcodeToDirection(netEvt.Opcode, netEvt.Protocol)
+			netEvt.Direction = events.InferDirection(netEvt.Opcode, netEvt.Protocol)
 		}
 		if netEvt.Direction == "" {
 			netEvt.Direction = "unknown"
@@ -302,7 +298,7 @@ func (e *Engine) HandleProcessStart(ev events.EventInput) {
 	tableMu.Unlock()
 
 	go e.enrichAsync(ev.PID, imageName)
-	resolvePendingChildren(ev.PID)
+	e.resolvePendingChildren(ev.PID)
 	emitProcessStart(proc, seq)
 }
 
@@ -355,7 +351,6 @@ func (e *Engine) HandleProcessStop(ev events.EventInput) {
 		PID:              ev.PID,
 		PPID:             ppid,
 		Image:            resolvedName,
-		StartTime:        ev.Timestamp.Add(-1 * time.Second),
 		EndTime:          ev.Timestamp,
 		IsAlive:          false,
 		ParentImage:      parentImg,
@@ -371,7 +366,7 @@ func (e *Engine) HandleProcessStop(ev events.EventInput) {
 	emitProcessStop(proc)
 }
 
-func resolvePendingChildren(parentPID uint32) {
+func (e *Engine) resolvePendingChildren(parentPID uint32) {
 	pendingMu.Lock()
 	children, ok := pendingEvents[parentPID]
 	if !ok {
@@ -388,16 +383,11 @@ func resolvePendingChildren(parentPID uint32) {
 		return
 	}
 	for _, childEv := range children {
-		HandleProcessStartWrapper(childEv)
+		e.HandleProcessStart(childEv)
 	}
 }
 
-func HandleProcessStartWrapper(ev events.EventInput) {
-	e := &Engine{}
-	e.HandleProcessStart(ev)
-}
-
-func runPendingResolver() {
+func (e *Engine) runPendingResolver() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -413,7 +403,7 @@ func runPendingResolver() {
 		pendingMu.Unlock()
 
 		for _, ppid := range toResolve {
-			resolvePendingChildren(ppid)
+			e.resolvePendingChildren(ppid)
 		}
 	}
 }
@@ -514,23 +504,5 @@ func mapOpcodeToConnectionState(opcode uint8, protocol string) ConnectionState {
 		return StateClosed
 	default:
 		return StateNew
-	}
-}
-
-func mapOpcodeToDirection(opcode uint8, protocol string) string {
-	if protocol != "TCP" {
-		return "unknown"
-	}
-	const (
-		opcodeConnect uint8 = 10
-		opcodeAccept  uint8 = 11
-	)
-	switch opcode {
-	case opcodeConnect:
-		return "outbound"
-	case opcodeAccept:
-		return "inbound"
-	default:
-		return "unknown"
 	}
 }

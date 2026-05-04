@@ -8,6 +8,7 @@ Status:
 - validated on Windows with Administrator runtime
 - `process_start` and `process_stop` now emit correctly
 - process stop fallback no longer leaves `unknown_process` rows in the latest validated process file
+- telemetry modes now support `baseline` and `deep`
 
 ## What Phase 2 Does
 
@@ -16,7 +17,8 @@ Phase 2 converts raw Windows kernel ETW events into structured telemetry for:
 - process lifecycle
 - process genealogy
 - process-to-network correlation
-- NDJSON export for local analysis and cloud ingestion
+- summary-first NDJSON export for local analysis and cloud ingestion
+- local forensic bundle capture in deep mode
 
 It is built on the `NT Kernel Logger` session and captures:
 
@@ -48,6 +50,8 @@ to:
 - stable `process_stop`
 - working parent-child correlation
 - clean process and network output separation
+- baseline summary shaping for lower-cost always-on collection
+- deep local capture for short-lived investigations
 
 ## Process Genealogy
 
@@ -78,11 +82,10 @@ Why this matters:
 
 Important schema note:
 
-- stdout and the in-memory structured event path carry the richer genealogy fields
-- the persisted process NDJSON schema currently keeps `ppid` and `parent_image`, but not the full `chain` / `depth` set yet
+- stdout and the in-memory structured event path still carry the richest event-by-event view
+- baseline persistence now writes genealogy into `process_execution` rows with `parent_execution_id`, `root_execution_id`, `parent_image`, `grandparent_image`, `chain`, and `depth`
+- legacy raw `processes_*.ndjson` and `network_*.ndjson` files are optional and disabled by default
 - process and app outputs no longer include `is_signed`
-
-So the genealogy logic is live, but the durable file schema still has room to grow.
 
 ## Runtime Architecture
 
@@ -91,11 +94,13 @@ The working order today is:
 1. initialize device ID, sinks, and privileges
 2. load network filtering config
 3. build an initial process snapshot
-4. start the correlation engine
-5. start the ETW listener
-6. receive native ETW callbacks in C
-7. normalize events into Go structs
-8. correlate, enrich, and emit process and network records
+4. seed the telemetry controller with already-running processes
+5. start the correlation engine
+6. start the ETW listener
+7. receive native ETW callbacks in C
+8. normalize events into Go structs
+9. correlate, enrich, and emit process and network records
+10. summarize them into baseline records or store them in a deep local capture bundle
 
 ## Key Modules
 
@@ -124,6 +129,12 @@ Process metadata:
 
 - [D:\Project\Exionis-swg\agent\internal\process\collector.go](D:/Project/Exionis-swg/agent/internal/process/collector.go)
 
+Telemetry shaping:
+
+- [D:\Project\Exionis-swg\agent\internal\telemetry\config.go](D:/Project/Exionis-swg/agent/internal/telemetry/config.go)
+- [D:\Project\Exionis-swg\agent\internal\telemetry\controller.go](D:/Project/Exionis-swg/agent/internal/telemetry/controller.go)
+- [D:\Project\Exionis-swg\agent\internal\telemetry\types.go](D:/Project/Exionis-swg/agent/internal/telemetry/types.go)
+
 Output:
 
 - [D:\Project\Exionis-swg\agent\internal\output\file_output.go](D:/Project/Exionis-swg/agent/internal/output/file_output.go)
@@ -131,13 +142,16 @@ Output:
 
 ## Output Files
 
-Process file:
+Baseline files:
 
-- `C:\ProgramData\Exionis\output\processes_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\process_execution_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\process_edge_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\network_rollup_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\telemetry_mode_<device_id>_<date>.ndjson`
 
-Network file:
+Deep capture:
 
-- `C:\ProgramData\Exionis\output\network_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\deep\deep_capture_<device_id>_<session>.ndjson.gz`
 
 Combined sink:
 
@@ -145,9 +159,9 @@ Combined sink:
 
 Current behavior:
 
-- process events stay in the process file
-- network events stay in the network file
-- the combined sink holds mixed event types for debugging and export
+- baseline mode writes summary-first records only
+- deep mode keeps the same baseline files and also writes a local gzip forensic bundle
+- legacy raw process and network files are only written when `EXIONIS_WRITE_LEGACY_RAW=1`
 
 ## Build and Test
 
@@ -172,6 +186,19 @@ Run:
 cd D:\Project\Exionis-swg\agent
 
 Remove-Item .\output.log,.\debug.log -Force -ErrorAction SilentlyContinue
+$env:EXIONIS_TELEMETRY_MODE='baseline'
+$env:EXIONIS_DEBUG='1'
+.\exionis-agent.exe > output.log 2> debug.log
+```
+
+Deep mode:
+
+```powershell
+cd D:\Project\Exionis-swg\agent
+
+Remove-Item .\output.log,.\debug.log -Force -ErrorAction SilentlyContinue
+$env:EXIONIS_TELEMETRY_MODE='deep'
+$env:EXIONIS_DEEP_DURATION_MINUTES='30'
 $env:EXIONIS_DEBUG='1'
 .\exionis-agent.exe > output.log 2> debug.log
 ```
@@ -188,8 +215,9 @@ Then stop the agent and inspect:
 ```powershell
 Select-String -Path .\debug.log -Pattern "PROCESS_START","PROCESS_STOP"
 Select-String -Path .\output.log -Pattern '"event_type":"process_start"','"event_type":"process_stop"'
-Get-Content "C:\ProgramData\Exionis\output\processes_*.ndjson"
-Get-Content "C:\ProgramData\Exionis\output\network_*.ndjson"
+Get-Content "C:\ProgramData\Exionis\output\process_execution_*.ndjson"
+Get-Content "C:\ProgramData\Exionis\output\process_edge_*.ndjson"
+Get-Content "C:\ProgramData\Exionis\output\network_rollup_*.ndjson"
 ```
 
 ## What Good Output Looks Like
@@ -198,9 +226,9 @@ Good signs:
 
 - `debug.log` shows `PROCESS_START` and `PROCESS_STOP`
 - `output.log` shows `process_start` and `process_stop`
-- the process NDJSON file contains the launched processes
-- network records continue to flow
-- process rows no longer fall back to `unknown_process`
+- `process_execution_*.ndjson` contains finished process runs
+- `process_edge_*.ndjson` contains parent-child edges
+- network rollups continue to flow
 
 ## Known Boundaries
 
@@ -208,8 +236,9 @@ These are still worth keeping in view:
 
 1. full durable lineage persistence is not complete yet because the process file schema does not yet store the entire runtime chain model
 2. very short-lived processes can still have partial start-time enrichment
-3. the correlation package is cleaner now, but long-term scale still points toward a dedicated lineage package
-4. DNS is still enrichment-driven rather than full DNS-client ETW ingestion
+3. file-summary and DLP policy streams are future work
+4. the correlation package is cleaner now, but long-term scale still points toward a dedicated lineage package
+5. DNS is still enrichment-driven rather than full DNS-client ETW ingestion
 
 ## Best Next Architecture Move
 

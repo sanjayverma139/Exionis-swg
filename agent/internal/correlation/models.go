@@ -85,7 +85,7 @@ type StructuredEvent struct {
 	IsAlive          bool              `json:"is_alive"`
 	Resolved         bool              `json:"resolved"`
 	Enrichment       ProcessEnrichment `json:"enrichment,omitempty"`
-	SequenceID       uint64            `json:"-"`
+	SequenceID       uint64            `json:"sequence_id,omitempty"`
 
 	// === RISK SCORING FIELDS (non-blocking, informational) ===
 	RiskScore   int      `json:"risk_score,omitempty"`

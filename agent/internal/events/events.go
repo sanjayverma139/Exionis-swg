@@ -64,3 +64,18 @@ type NetworkOutputRecord struct {
 	BytesRecv  uint64 `json:"bytes_recv,omitempty"`
 	State      string `json:"state"`
 }
+
+// InferDirection converts ETW TCP/IP opcodes into a human-readable direction.
+func InferDirection(opcode uint8, protocol string) string {
+	if protocol != "TCP" {
+		return "unknown"
+	}
+	switch opcode {
+	case 10, 12, 13, 16: // Connect, Reconnect, Send, Retransmit
+		return "outbound"
+	case 11, 14: // Accept, Receive
+		return "inbound"
+	default:
+		return "unknown"
+	}
+}

@@ -3,6 +3,8 @@ package correlation
 import "exionis/internal/process"
 
 func buildGenealogyChain(pid uint32, imageName string, ppid uint32) (parentImg, grandParentImg, chain string, depth int, rootPID uint32) {
+	// Keep this read-locked section free of any correlation-table mutations.
+	// The fallback name lookup below intentionally stays outside correlation state.
 	tableMu.RLock()
 	defer tableMu.RUnlock()
 

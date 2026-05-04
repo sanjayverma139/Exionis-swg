@@ -13,6 +13,7 @@ The current implementation is good enough to produce useful endpoint telemetry t
 - parent-child execution context
 - process-to-network correlation
 - NDJSON output for later backend ingestion
+- summary-first baseline telemetry with optional deep local capture
 
 ## Phase 1
 
@@ -43,7 +44,9 @@ What it does:
 - captures TCP and UDP ETW events
 - correlates process and network activity
 - enriches processes with file and user metadata
-- emits structured records to stdout and NDJSON files
+- emits structured records to stdout
+- summarizes them into baseline execution, edge, and network-rollup records
+- optionally stores deep local forensic bundles
 
 Primary files:
 
@@ -94,10 +97,11 @@ That makes the agent much more useful for:
 - lateral movement
 - ransomware ancestry
 
-One honest limitation remains:
+Baseline durability now includes richer genealogy than before:
 
-- the process output file currently persists `ppid` and `parent_image`
-- the richer `chain`, `grandparent_image`, and `depth` fields are present in the live structured event path, but not yet in the dedicated process NDJSON schema
+- `process_execution` rows store `parent_execution_id`, `root_execution_id`, `parent_image`, `grandparent_image`, `chain`, and `depth`
+- `process_edge` rows store the durable parent -> child graph
+- raw lifecycle files are now optional compatibility outputs instead of the default storage model
 
 ## Current Workflow
 
@@ -106,11 +110,13 @@ The live workflow is:
 1. initialize device ID, sinks, and privileges
 2. run app inventory
 3. build the initial process table
-4. start the correlation engine
-5. start the ETW listener
-6. receive ETW callbacks in C
-7. translate them into Go events
-8. correlate, enrich, and emit process and network telemetry
+4. seed the telemetry controller with already-running processes
+5. start the correlation engine
+6. start the ETW listener
+7. receive ETW callbacks in C
+8. translate them into Go events
+9. correlate, enrich, and emit process and network telemetry
+10. write baseline summaries or deep local capture artifacts depending on mode
 
 ## Output Files
 
@@ -120,8 +126,14 @@ Phase 1 output:
 
 Phase 2 output:
 
-- `C:\ProgramData\Exionis\output\processes_<device_id>_<date>.ndjson`
-- `C:\ProgramData\Exionis\output\network_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\process_execution_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\process_edge_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\network_rollup_<device_id>_<date>.ndjson`
+- `C:\ProgramData\Exionis\output\telemetry_mode_<device_id>_<date>.ndjson`
+
+Deep mode output:
+
+- `C:\ProgramData\Exionis\deep\deep_capture_<device_id>_<session>.ndjson.gz`
 
 Combined sink:
 
@@ -134,6 +146,7 @@ The directory structure is acceptable for the current stage:
 - `cmd/agent` as entrypoint
 - `internal/etw` for native capture
 - `internal/correlation` for runtime logic
+- `internal/telemetry` for baseline/deep mode shaping and deep capture lifecycle
 - `internal/process` for metadata helpers
 - `internal/inventory` for Phase 1 inventory
 - `internal/output` and `internal/logger` for persistence
@@ -169,6 +182,12 @@ Best next refactor:
 2. store process instances by `PID + StartTime`
 3. reconstruct ancestry from registry state instead of relying mostly on flat strings
 4. keep `detect` logic separate from capture and correlation
+
+## Delivery Roadmap
+
+The active delivery roadmap now lives in:
+
+- [D:\Project\Exionis-swg\ROADMAP.md](D:/Project/Exionis-swg/ROADMAP.md)
 
 That is the direction you want if the end goal is deep execution trees like:
 

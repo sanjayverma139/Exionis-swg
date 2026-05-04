@@ -14,7 +14,7 @@ import (
 )
 
 // runAppInventory scans installed applications and writes them to all sinks.
-func runAppInventory(outMgr *output.Manager, logSink *logger.FileSink, deviceID, scanTime string) {
+func runAppInventory(outMgr *output.Manager, logSink *logger.FileSink, deviceID, hostname, scanTime string) {
 	apps := inventory.CollectInstalledApps()
 	if len(apps) == 0 {
 		return
@@ -24,6 +24,7 @@ func runAppInventory(outMgr *output.Manager, logSink *logger.FileSink, deviceID,
 		"event_type":     "device_inventory",
 		"timestamp":      scanTime,
 		"device_id":      deviceID,
+		"hostname":       hostname,
 		"agent_version":  agentVersion,
 		"policy_version": policyVersion,
 		"installed_apps": apps,
@@ -60,6 +61,7 @@ func scheduleDailyAppInventory(
 	outMgr *output.Manager,
 	logSink *logger.FileSink,
 	deviceID string,
+	hostname string,
 	stop <-chan struct{},
 ) {
 	for {
@@ -78,7 +80,7 @@ func scheduleDailyAppInventory(
 		case <-timer.C:
 			scanTime := time.Now().Format(time.RFC3339Nano)
 			fmt.Printf("[Exionis] Running scheduled app inventory scan at %s\n", scanTime)
-			runAppInventory(outMgr, logSink, deviceID, scanTime)
+			runAppInventory(outMgr, logSink, deviceID, hostname, scanTime)
 		case <-stop:
 			timer.Stop()
 			return
